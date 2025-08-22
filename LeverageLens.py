@@ -61,11 +61,13 @@ import tempfile, shutil, atexit
 from datetime import timedelta
 import yfinance as yf
 from functools import lru_cache
+from dash import no_update
 import math
 import pytz
 from datetime import datetime
 import plotly.io as pio
 from threading import Lock
+import threading, time
 import os, sys
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
@@ -138,7 +140,6 @@ _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 
 
-
 import os, subprocess
 
 def make_driver() -> webdriver.Chrome:
@@ -181,6 +182,46 @@ def resource_path(rel_path: str) -> str:
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, rel_path)
     return os.path.join(os.path.dirname(__file__), rel_path)        
+
+import os
+SERVER_MODE = bool(os.environ.get("RENDER") or os.environ.get("STRATO") or os.environ.get("SERVER_MODE"))
+
+# CSV-Ordner klar trennen, damit du lokal & Server-Dateien nicht vermischst
+CSV_ROOT = "CSV_server" if SERVER_MODE else "CSV_local"
+os.makedirs(CSV_ROOT, exist_ok=True)
+
+def get_csv_filename(underlying):
+    # falls du die alte get_csv_filename() weiter unten hast: diese Version verwenden
+    return os.path.join(CSV_ROOT, f"hebel_{underlying.replace(' ', '_')}.csv")
+
+###Serverseitige Auto-Aufräumroutine (alle 30 Min)
+
+import threading, time
+
+def _cleanup_csv_folder(period_seconds=1800, max_age_minutes=45):
+    """Server: löscht CSV-Dateien, deren mtime älter als max_age_minutes ist."""
+    while True:
+        try:
+            now_ts = time.time()
+            max_age = max_age_minutes * 60
+            removed = 0
+            for fn in os.listdir(CSV_ROOT):
+                if not fn.lower().endswith(".csv"):
+                    continue
+                path = os.path.join(CSV_ROOT, fn)
+                try:
+                    mtime = os.path.getmtime(path)
+                    if now_ts - mtime > max_age:
+                        os.remove(path)
+                        removed += 1
+                except Exception:
+                    pass
+            if removed:
+                print(f"[CLEANUP] Entfernt: {removed} CSV (älter als {max_age_minutes} min)")
+        except Exception as e:
+            print(f"[CLEANUP] Fehler: {e}")
+        time.sleep(period_seconds)
+
 
 # --- Alarm-Konfiguration ---
 ALARM_FILE_SINGLE = os.path.join(os.path.dirname(__file__), "Alarm1.wav")
@@ -1250,6 +1291,36 @@ def on_sound_toggle(value):
     return [{"label": "🔔" if on else "🔕", "value": "on"}]
 
 
+#Button-Callback so umbauen, dass er im Servermodus nichts löscht
+@app.callback(
+    Output("last-fetch-time", "children"),
+    Input("reset-btn", "n_clicks"),
+    State("underlying-dropdown", "value"),
+    prevent_initial_call=True
+)
+def on_reset_csv(n_clicks, selected):
+    if not n_clicks:
+        return no_update
+
+    if SERVER_MODE:
+        # Server: NICHT löschen – nur Info anzeigen
+        return f"CSV-Löschung auf Server deaktiviert (Schutz). Letzte Abfrage: {last_fetch_time}"
+    else:
+        # Lokal: wirklich löschen (alle CSV in diesem Root)
+        try:
+            removed = 0
+            for fn in os.listdir(CSV_ROOT):
+                if fn.lower().endswith(".csv"):
+                    os.remove(os.path.join(CSV_ROOT, fn))
+                    removed += 1
+            ts = datetime.now(tz).strftime("%H:%M:%S")
+            return f"Lokale CSV gelöscht ({removed} Dateien) um {ts}"
+        except Exception as e:
+            return f"Fehler beim Löschen: {e}"
+
+
+
+
 # Volatilitäts-Label
 @app.callback(
     Output('volatility-toggle', 'options'),
@@ -1513,6 +1584,11 @@ def close_app(n_clicks):
 
 if __name__ == "__main__":
     start_update_thread()
+
+    if SERVER_MODE:
+        # Auto-Cleanup nur im Servermodus starten
+        threading.Thread(target=_cleanup_csv_folder, kwargs={"period_seconds": 1800, "max_age_minutes": 45}, daemon=True).start()
+
 
 
     
