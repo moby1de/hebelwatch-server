@@ -1492,5 +1492,16 @@ def close_app(n_clicks):
 
 if __name__ == "__main__":
     start_update_thread()
-    threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
-    app.run(debug=False, host="127.0.0.1", port=8050)
+
+    # Host/Port je nach Umgebung
+    host = "0.0.0.0" if IS_SERVER else "127.0.0.1"
+    port = int(os.environ.get("PORT", "8050"))
+
+    # Browser nur lokal öffnen
+    if not IS_SERVER:
+        import threading, webbrowser
+        threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
+
+    # Dash korrekt starten (bindet auf 0.0.0.0 im Servermodus)
+    app.run_server(debug=not IS_SERVER, host=host, port=port)
+
