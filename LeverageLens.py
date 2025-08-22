@@ -1654,12 +1654,12 @@ import os
 )
 def close_app(n_clicks):
     if not n_clicks:
-        return dash.no_update
+        return no_update
 
     # Prüfen: lokal oder Server
     if "RENDER" in os.environ or "STRATO" in os.environ:
         # Servermodus → tue nichts
-        return dash.no_update
+        return no_update
     else:
         # Lokaler Modus → wirklich beenden
         os._exit(0)
