@@ -1500,10 +1500,21 @@ import os
     prevent_initial_call=True
 )
 def close_app(n_clicks):
-    os._exit(0)   # beendet das Programm sofort
+    if not n_clicks:
+        return dash.no_update
+
+    # Prüfen: lokal oder Server
+    if "RENDER" in os.environ or "STRATO" in os.environ:
+        # Servermodus → nur Hinweis ausgeben
+        return "Leverage Lens (Servermodus – Beenden deaktiviert)"
+    else:
+        # Lokaler Modus → wirklich beenden
+        os._exit(0)
 
 if __name__ == "__main__":
     start_update_thread()
+
+
     
     # Port aus Umgebungsvariable für Cloud-Hosting (z.B. Render) oder lokal 8050
     port = int(os.environ.get("PORT", 8050))
