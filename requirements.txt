@@ -1,0 +1,32 @@
+# HebelWatch requirements (Windows, modern Python e.g. 3.13) – bevorzugt Binary Wheels
+# Installation:
+#   python -m pip install --upgrade pip setuptools wheel
+#   python -m pip install --only-binary=:all: -r requirements_py313_win.txt
+#
+# Core scientific stack (NumPy>=2 because ältere 1.26.* wird für neue Python-Versionen nicht mehr angeboten)
+numpy==2.3.*
+pandas==2.3.*
+
+# Web/UI
+dash==2.17.*
+plotly==5.*
+requests==2.*
+
+# Parsing
+beautifulsoup4==4.*
+lxml==5.*
+
+# Scraping & Browser
+selenium==4.*
+webdriver-manager==4.*
+
+# Finance/Data
+yfinance==0.2.*
+pytz==2025.*
+
+# Audio (optional)
+simpleaudio==1.*
+
+# Optional Server (Deployment)
+gunicorn==22.* ; platform_system != "Windows"
+# waitress==3.* ; platform_system == "Windows"
