@@ -1,4 +1,4 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v60 #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v59 #
 # Kontrolle bei Programmstart - notwendige Module
 import sys
 required_modules = {
@@ -71,9 +71,6 @@ import pytz
 from datetime import datetime
 import plotly.io as pio
 from threading import Lock
-# Alte Importe ersetzen durch:
-from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.os_manager import ChromeType
 import os, sys
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
@@ -90,23 +87,8 @@ from datetime import datetime
 
 TZ_BERLIN = pytz.timezone("Europe/Berlin")
 
-def make_driver():
-    opts = Options()
-    opts.add_argument("--headless=new")     # Server/CI
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
 
-    # Falls du garantiert Chromium (nicht Google Chrome) nutzt:
-    if os.path.exists("/usr/bin/chromium"):
-        opts.binary_location = "/usr/bin/chromium"
 
-    # ChromeDriverManager für die korrekte Version verwenden
-    from webdriver_manager.chrome import ChromeDriverManager
-    from webdriver_manager.core.os_manager import ChromeType
-    
-    service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
-    driver = webdriver.Chrome(service=service, options=opts)
-    return driver
 
 # --- VSTOXX (stock3) robust ---
 _last_vstoxx_change = None
@@ -164,21 +146,6 @@ def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
 _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 
-# --- Laufzeitumgebung erkennen ---
-def is_server() -> bool:
-    """True = Serverbetrieb, False = lokal.
-    Steuerung primär über Env-Var oder Marker-Datei .server im Projektordner.
-    """
-    val = os.environ.get("LEVERAGELENS_MODE", "").strip().lower()
-    if val in {"server", "prod", "production", "1", "true", "yes"}:
-        return True
-    # Fallback: Marker-Datei neben diesem Skript
-    try:
-        return os.path.exists(os.path.join(os.path.dirname(__file__), ".server"))
-    except Exception:
-        return False
-
-IS_SERVER = is_server()
 
 
 
@@ -313,12 +280,7 @@ def get_driver() -> webdriver.Chrome:
             except:
                 pass
         if _DRIVER is None:
-            # Import innerhalb der Funktion, um zirkuläre Importe zu vermeiden
-            from webdriver_manager.chrome import ChromeDriverManager
-            from webdriver_manager.core.os_manager import ChromeType
-            
-            # ChromeDriverManager mit Chromium-Typ verwenden
-            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+            service = Service(ChromeDriverManager().install())
             _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
         return _DRIVER
 
@@ -708,7 +670,7 @@ def log_index_event(timestamp, index_change):
             writer.writerow(["timestamp", "index_change"])
         writer.writerow([timestamp, index_change])
 
-
+@lru_cache(maxsize=8)
 def scrape_average_leverage(url_onvista, url_finanzen=None):
     """Liest durchschnittliche Hebelwerte ausschließlich von OnVista (kein Finanzen-Fallback)."""
     print(f"Versuche Daten von OnVista URL abzurufen: {url_onvista}")
@@ -1208,7 +1170,7 @@ app.layout = html.Div([
         dcc.Input(id='interval-input', type='number', value=refresh_interval, min=5, step=1,
                   style={'width': '40px', "fontSize": "18px", "fontWeight": "bold","textAlign": "center"}),
         html.Button("Intervall ändern (Sek)", id="set-interval-btn", style={'marginLeft': '7px', "fontSize": "18px"}),
-        html.Button("Alle CSV löschen", id="reset-btn", style={'marginLeft': '7px', "fontSize": "18px"},disabled=IS_SERVER)
+        html.Button("Alle CSV löschen", id="reset-btn", style={'marginLeft': '7px', "fontSize": "18px"})
     ], style={'margin': '20px 0'}),
 
     # ---- Ton-Schalter (bereinigt) ----
@@ -1253,8 +1215,6 @@ def on_sound_toggle(value):
     set_sound_enabled(on)
     # zeigt Glocke an/aus im Kästchen
     return [{"label": "🔔" if on else "🔕", "value": "on"}]
-    
-
 
 
 # Volatilitäts-Label
@@ -1506,25 +1466,10 @@ import os
     prevent_initial_call=True
 )
 def close_app(n_clicks):
-    if IS_SERVER:
-        # Auf Server: Klick ignorieren, nichts beenden
-        return "Leverage Lens"
-    os._exit(0)   # lokal: sofort beenden
-
+    os._exit(0)   # beendet das Programm sofort
 
 
 if __name__ == "__main__":
     start_update_thread()
-
-    # Host/Port je nach Umgebung
-    host = "0.0.0.0" if IS_SERVER else "127.0.0.1"
-    port = int(os.environ.get("PORT", "8050"))
-
-    # Browser nur lokal öffnen
-    if not IS_SERVER:
-        import threading, webbrowser
-        threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
-
-    # Dash korrekt starten (bindet auf 0.0.0.0 im Servermodus)
-    # DEBUG auf False setzen und use_reloader=False hinzufügen
-    app.run_server(debug=not IS_SERVER, host=host, port=port, use_reloader=False)
+    threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+    app.run(debug=False, host="127.0.0.1", port=8050)
