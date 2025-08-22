@@ -26,7 +26,7 @@ pytz==2025.*
 
 # Audio (optional)
 +# Audio (optional; nur Windows – auf Linux/Server nicht installieren)
-+simpleaudio==1.* ; platform_system == "Windows"
+simpleaudio==1.* ; platform_system == "Windows"
 
 # Optional Server (Deployment)
 gunicorn==22.* ; platform_system != "Windows"
