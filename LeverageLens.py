@@ -1505,8 +1505,8 @@ def close_app(n_clicks):
 
     # Prüfen: lokal oder Server
     if "RENDER" in os.environ or "STRATO" in os.environ:
-        # Servermodus → nur Hinweis ausgeben
-        return "Leverage Lens (Servermodus – Beenden deaktiviert)"
+        # Servermodus → tue nichts
+        return dash.no_update
     else:
         # Lokaler Modus → wirklich beenden
         os._exit(0)
