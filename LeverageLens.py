@@ -1488,4 +1488,11 @@ def close_app(n_clicks):
 if __name__ == "__main__":
     start_update_thread()
     threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
-    app.run(debug=False, host="127.0.0.1", port=8050, use_reloader=False)
+    try:
+        app.run(debug=False, host="127.0.0.1", port=8050, use_reloader=False)
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"Port 8050 is already in use. Trying port 8051...")
+            app.run(debug=False, host="127.0.0.1", port=8051, use_reloader=False)
+        else:
+            raise e
