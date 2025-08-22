@@ -1462,33 +1462,16 @@ import os
 def close_app(n_clicks):
     os._exit(0)   # beendet das Programm sofort
 
-server = app.server
-# --- App-Start (lokal & Render) -----------------------------------
 if __name__ == "__main__":
-    import os, sys, threading
-
-    # (optional) Commit-Print für Render-Logs
-    print("LeverageLens START COMMIT:",
-          os.environ.get("RENDER_GIT_COMMIT", "unknown"),
-          file=sys.stderr, flush=True)
-
-    # optionaler Hintergrund-Task, nur wenn vorhanden
-    bg_target = globals().get("warmup_or_fetch")
-    if callable(bg_target):
-        threading.Thread(target=bg_target, daemon=True).start()
-
-    # lokal & Render kompatibel
-    port  = int(os.getenv("PORT", 8050))          # Render setzt PORT
-    host  = os.getenv("HOST", "0.0.0.0")          # 0.0.0.0 funktioniert lokal & im Container
-    debug = os.getenv("DASH_DEBUG", "1") == "1"   # lokal bequem debuggen
-
-    # falls du gunicorn nutzen willst, ist 'server = app.server' praktisch:
-    try:
-        server = app.server
-    except Exception:
-        pass
-
-    app.run_server(host=host, port=port, debug=debug)
-
-
+    start_update_thread()
+    
+    # Port aus Umgebungsvariable für Cloud-Hosting (z.B. Render) oder lokal 8050
+    port = int(os.environ.get("PORT", 8050))
+    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
+    
+    # Nur lokal den Browser öffnen
+    if host == "127.0.0.1":
+        threading.Timer(0.8, lambda: webbrowser.open(f"http://{host}:{port}")).start()
+    
+    app.run(debug=False, host=host, port=port)
 
