@@ -79,7 +79,7 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 
-
+tz = pytz.timezone("Europe/Berlin")
 
 # --- VSTOXX (stock3) robust ---
 _last_vstoxx_change = None
@@ -413,7 +413,8 @@ def bewerte_rsi_ampel(rsi_value):
 CSV_FOLDER = "CSV"
 os.makedirs(CSV_FOLDER, exist_ok=True)
 
-scraper_start_time = datetime.now().strftime("%H:%M:%S")
+scraper_start_time = datetime.now(pytz.timezone("Europe/Berlin")).strftime("%H:%M:%S")
+
 persistenter_kommentar = ""
 persistenz_counter = 0
 verhältnis_vorher = 0
@@ -1098,37 +1099,54 @@ def update_data():
     while not stop_event.is_set():
         current_underlying = selected_underlying
         urls = UNDERLYINGS[current_underlying]
+
         long_avg = scrape_average_leverage(urls["long"])
         short_avg = scrape_average_leverage(urls["short"])
+
         index_data = get_index_data(current_underlying)
         index_change, index_display_value = (None, "-")
         if index_data and len(index_data) == 3:
             index_change, index_display_value, _ = index_data
 
         if index_change is None:
-               
             ft_change = get_index_change_from_finanztreff(current_underlying)
             if ft_change is not None:
                 index_change = ft_change
 
         vola_change = get_volatility_change(current_underlying)
         print(f"Volatility change for {current_underlying}: {vola_change}")
+
         if None not in (long_avg, short_avg, index_change) and abs(index_change) < 10:
             csv_file = get_csv_filename(current_underlying)
+
+            # Berliner Zeit verwenden
             new_data = pd.DataFrame([[
-                datetime.now(), long_avg, short_avg, index_change,
-                (short_avg/long_avg-1)*100 if (long_avg + short_avg) > 0 else None,
+                datetime.now(tz),  # tz = pytz.timezone("Europe/Berlin"), global definiert
+                long_avg,
+                short_avg,
+                index_change,
+                (short_avg / long_avg - 1) * 100 if (long_avg + short_avg) > 0 else None,
                 vola_change
-            ]], columns=["timestamp","long_avg","short_avg","index_change","short_vs_long_diff_prozent","volatility_change"])
+            ]], columns=[
+                "timestamp", "long_avg", "short_avg",
+                "index_change", "short_vs_long_diff_prozent", "volatility_change"
+            ])
+
             if os.path.exists(csv_file):
                 df = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
-                if len(df) > 1000: df = df.iloc[-1000:]
+                if len(df) > 1000:
+                    df = df.iloc[-1000:]
                 df = pd.concat([df, new_data], ignore_index=True)
             else:
                 df = new_data
+
             df.to_csv(csv_file, index=False, encoding='utf-8', lineterminator='\n')
-            last_fetch_time = datetime.now().strftime("%H:%M:%S")
+
+            # ebenfalls Berliner Zeit für die Anzeige
+            last_fetch_time = datetime.now(tz).strftime("%H:%M:%S")
+
         time.sleep(refresh_interval)
+
 
 def start_update_thread():
     global update_thread, stop_event
@@ -1334,7 +1352,8 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             margin=dict(l=50, r=50, b=50, t=80, pad=4), height=500, plot_bgcolor='rgba(240,240,240,0.8)'
         )
     else:
-        now = datetime.now()
+        now = datetime.now(pytz.timezone("Europe/Berlin"))
+
         placeholder_text = "Warte auf ausreichende Daten..." if len(df) == 1 else "Warte auf erste Daten..."
         fig.add_annotation(text=placeholder_text, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="gray"))
         fig.add_trace(go.Scatter(x=[now - timedelta(minutes=5), now], y=[0, 50], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='none'))
