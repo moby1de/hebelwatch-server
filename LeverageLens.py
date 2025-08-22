@@ -71,6 +71,9 @@ import pytz
 from datetime import datetime
 import plotly.io as pio
 from threading import Lock
+# Alte Importe ersetzen durch:
+from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.os_manager import ChromeType
 import os, sys
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
@@ -97,12 +100,13 @@ def make_driver():
     if os.path.exists("/usr/bin/chromium"):
         opts.binary_location = "/usr/bin/chromium"
 
-    # WICHTIG: keinen executable_path setzen, keinen alten Pfad übergeben!
-    service = Service()  # <- Selenium Manager kümmert sich um den passenden Treiber
-
+    # ChromeDriverManager für die korrekte Version verwenden
+    from webdriver_manager.chrome import ChromeDriverManager
+    from webdriver_manager.core.os_manager import ChromeType
+    
+    service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
     driver = webdriver.Chrome(service=service, options=opts)
     return driver
-
 
 # --- VSTOXX (stock3) robust ---
 _last_vstoxx_change = None
@@ -309,7 +313,12 @@ def get_driver() -> webdriver.Chrome:
             except:
                 pass
         if _DRIVER is None:
-            service = Service(ChromeDriverManager().install())
+            # Import innerhalb der Funktion, um zirkuläre Importe zu vermeiden
+            from webdriver_manager.chrome import ChromeDriverManager
+            from webdriver_manager.core.os_manager import ChromeType
+            
+            # ChromeDriverManager mit Chromium-Typ verwenden
+            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
             _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
         return _DRIVER
 
