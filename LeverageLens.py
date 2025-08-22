@@ -5,7 +5,6 @@ required_modules = {
     "pandas": "pandas",
     "dash": "dash",
     "selenium": "selenium",
-    "webdriver_manager": "webdriver-manager",
     "yfinance": "yfinance",
     "simpleaudio": "simpleaudio"
 }
@@ -16,10 +15,6 @@ try:
 except ImportError:
     fehlende_module.append("selenium")
 
-try:
-    import webdriver_manager
-except ImportError:
-    fehlende_module.append("webdriver-manager")
 
 try:
     import yfinance
@@ -57,7 +52,7 @@ from contextlib import contextmanager
 from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -143,6 +138,33 @@ _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 
 
+
+import os, subprocess
+
+def make_driver() -> webdriver.Chrome:
+    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium")
+    driver_bin = os.getenv("CHROMEDRIVER", "/usr/bin/chromedriver")
+
+    # Debug-Ausgabe, damit du im Log siehst, was wirklich genutzt wird
+    try:
+        print(subprocess.getoutput(f"{chrome_bin} --version"), flush=True)
+        print(subprocess.getoutput(f"{driver_bin} --version"), flush=True)
+    except Exception:
+        pass
+
+    opts = _make_chrome_options()
+    try:
+        opts.binary_location = chrome_bin    
+    except Exception:
+        pass    
+        
+    opts.binary_location = chrome_bin
+    opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+
+    service = Service(driver_bin)
+    return webdriver.Chrome(service=service, options=opts)
 
 
 def set_sound_enabled(val: bool):
@@ -271,14 +293,13 @@ def get_driver() -> webdriver.Chrome:
     with _DRIVER_LOCK:
         if _DRIVER is not None:
             try:
-                # Lösche alle Cookies für eine frische Session
                 _DRIVER.delete_all_cookies()
-            except:
+            except Exception:
                 pass
         if _DRIVER is None:
-            service = Service(ChromeDriverManager().install())
-            _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
+            _DRIVER = make_driver()
         return _DRIVER
+
 
 def clean_ticker(symbol):
     return symbol.replace("$", "").strip()

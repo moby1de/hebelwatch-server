@@ -7,7 +7,6 @@ requests==2.*
 beautifulsoup4==4.*
 lxml==5.*              # lassen wir, Dockerfile liefert die Build-Deps
 selenium==4.*
-webdriver-manager==4.*
 yfinance==0.2.*
 pytz==2024.*           # ODER Zeile löschen, falls nicht benötigt
 gunicorn==22.*         # für Render/Prod
