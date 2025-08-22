@@ -1526,5 +1526,5 @@ if __name__ == "__main__":
         threading.Timer(0.8, lambda: webbrowser.open(f"http://127.0.0.1:{port}")).start()
 
     # Dash korrekt starten (bindet auf 0.0.0.0 im Servermodus)
-    app.run_server(debug=not IS_SERVER, host=host, port=port)
-
+    # DEBUG auf False setzen und use_reloader=False hinzufügen
+    app.run_server(debug=not IS_SERVER, host=host, port=port, use_reloader=False)
