@@ -25,7 +25,8 @@ yfinance==0.2.*
 pytz==2025.*
 
 # Audio (optional)
-simpleaudio==1.*
++# Audio (optional; nur Windows – auf Linux/Server nicht installieren)
++simpleaudio==1.* ; platform_system == "Windows"
 
 # Optional Server (Deployment)
 gunicorn==22.* ; platform_system != "Windows"
