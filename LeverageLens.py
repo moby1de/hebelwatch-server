@@ -1,4 +1,4 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v59 #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v60 #
 # Kontrolle bei Programmstart - notwendige Module
 import sys
 required_modules = {
