@@ -1457,6 +1457,22 @@ def reset_csv_files(n_clicks):
             os.remove(path)
     return 0
 
+def cleanup():
+    global _DRIVER, _TMP_PROFILE_DIR
+    if _DRIVER is not None:
+        try:
+            _DRIVER.quit()
+        except:
+            pass
+        _DRIVER = None
+    if _TMP_PROFILE_DIR and os.path.exists(_TMP_PROFILE_DIR):
+        try:
+            shutil.rmtree(_TMP_PROFILE_DIR)
+        except:
+            pass
+
+atexit.register(cleanup)
+
 import webbrowser, threading
 import os
 
@@ -1472,4 +1488,4 @@ def close_app(n_clicks):
 if __name__ == "__main__":
     start_update_thread()
     threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
-    app.run(debug=False, host="127.0.0.1", port=8050)
+    app.run(debug=False, host="127.0.0.1", port=8050, use_reloader=False)
