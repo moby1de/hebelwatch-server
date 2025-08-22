@@ -1,13 +1,13 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v58 #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v59 #
 # Kontrolle bei Programmstart - notwendige Module
 import sys
 required_modules = {
     "pandas": "pandas",
     "dash": "dash",
     "selenium": "selenium",
+    "webdriver_manager": "webdriver-manager",
     "yfinance": "yfinance",
-    "simpleaudio": "simpleaudio",
-    "webdriver_manager": "webdriver-manager",   # <— NEU
+    "simpleaudio": "simpleaudio"
 }
 
 fehlende_module = []
@@ -16,6 +16,10 @@ try:
 except ImportError:
     fehlende_module.append("selenium")
 
+try:
+    import webdriver_manager
+except ImportError:
+    fehlende_module.append("webdriver-manager")
 
 try:
     import yfinance
@@ -53,25 +57,24 @@ from contextlib import contextmanager
 from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from selenium.webdriver.chrome.service import Service
-
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 import tempfile, shutil, atexit
 from datetime import timedelta
 import yfinance as yf
 from functools import lru_cache
-from dash import no_update
 import math
 import pytz
 from datetime import datetime
 import plotly.io as pio
 from threading import Lock
-import threading, time
-import re
 import os, sys
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.common.exceptions import (
@@ -80,77 +83,15 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
 )
+from datetime import datetime
 
-tz = pytz.timezone("Europe/Berlin")
+TZ_BERLIN = pytz.timezone("Europe/Berlin")
+
+
+
 
 # --- VSTOXX (stock3) robust ---
 _last_vstoxx_change = None
-
-def get_leverage_distribution(underlying: str, driver) -> tuple[float,float] | None:
-    url = UNDERLYING_URLS.get(underlying)
-    if not url:
-        print(f"❌ Kein URL-Mapping für {underlying}")
-        return None
-    driver.get(url)
-
-    # Cookie-Banner wegklicken (Onetrust/Consent-Varianten)
-    try:
-        for selector in [
-            "#onetrust-accept-btn-handler",
-            "button[aria-label='Zustimmen']",
-            "button[title='Akzeptieren']",
-            "button:contains('Akzeptieren')",
-        ]:
-            try:
-                btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
-                btn.click()
-                break
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # Warte auf irgendeinen inhaltlichen Container der KO-Suche
-    try:
-        WebDriverWait(driver, 12).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #app, div"))
-        )
-        time.sleep(0.8)  # DOM settle
-    except Exception:
-        pass
-
-    html = driver.page_source
-
-    # 1) Versuch: explizite Prozent-Anzeige "Long xx,xx %", "Short yy,yy %"
-    m = re.search(r"Long[^0-9]+([0-9]{1,2}[,\.\s]?[0-9]{0,2})\s*%", html, re.I)
-    n = re.search(r"Short[^0-9]+([0-9]{1,2}[,\.\s]?[0-9]{0,2})\s*%", html, re.I)
-    if m and n:
-        long_p = float(m.group(1).replace(",", ".").replace(" ", ""))
-        short_p = float(n.group(1).replace(",", ".").replace(" ", ""))
-        print(f"✔️ Hebel gefunden (Text): Long={long_p:.2f}% Short={short_p:.2f}%")
-        return long_p, short_p
-
-    # 2) Versuch: Summen aus Tabellen (z. B. Anzahl Long vs Short)
-    try:
-        rows = driver.find_elements(By.CSS_SELECTOR, "table tr")
-        long_cnt = sum(1 for r in rows if re.search(r"long", r.text, re.I))
-        short_cnt = sum(1 for r in rows if re.search(r"short", r.text, re.I))
-        total = long_cnt + short_cnt
-        if total >= 5:  # Schwelle, damit Mini-Listen nicht rauschen
-            long_p = round(100.0 * long_cnt / total, 2)
-            short_p = round(100.0 * short_cnt / total, 2)
-            print(f"✔️ Hebel aus Zeilen: Long={long_p:.2f}% Short={short_p:.2f}% (N={total})")
-            return long_p, short_p
-    except Exception:
-        pass
-
-    # 3) Nichts gefunden ⇒ Snapshot zur Diagnose
-    ts = time.strftime("%Y%m%d_%H%M%S")
-    with open(f"logs/hebel_snapshot_{underlying}_{ts}.html", "w", encoding="utf-8") as f:
-        f.write(html[:500000])
-    print(f"❌ Keine Hebel gefunden – Snapshot gespeichert (logs/hebel_snapshot_{underlying}_{ts}.html)")
-    return None
-
 
 def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
     """
@@ -205,38 +146,21 @@ def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
 _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 
-
-import os, subprocess
-
-def make_driver():
-    import random
-    UAS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
-    ]
-    ua = random.choice(UAS)
+# --- Laufzeitumgebung erkennen ---
+def is_server() -> bool:
+    """True = Serverbetrieb, False = lokal.
+    Steuerung primär über Env-Var oder Marker-Datei .server im Projektordner.
+    """
+    val = os.environ.get("LEVERAGELENS_MODE", "").strip().lower()
+    if val in {"server", "prod", "production", "1", "true", "yes"}:
+        return True
+    # Fallback: Marker-Datei neben diesem Skript
     try:
-        import undetected_chromedriver as uc
-        from selenium.webdriver.chrome.options import Options
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument(f"--user-agent={ua}")
-        opts.add_argument("--lang=de-DE")
-        return uc.Chrome(options=opts)
+        return os.path.exists(os.path.join(os.path.dirname(__file__), ".server"))
     except Exception:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.service import Service
-        from selenium.webdriver.chrome.options import Options
-        from webdriver_manager.chrome import ChromeDriverManager
-        opts = Options()
-        opts.add_argument("--headless=new")
-        opts.add_argument("--no-sandbox")
-        opts.add_argument("--disable-dev-shm-usage")
-        opts.add_argument(f"--user-agent={ua}")
-        opts.add_argument("--lang=de-DE")
-        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
+        return False
+
+IS_SERVER = is_server()
 
 
 
@@ -254,46 +178,6 @@ def resource_path(rel_path: str) -> str:
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, rel_path)
     return os.path.join(os.path.dirname(__file__), rel_path)        
-
-import os
-SERVER_MODE = bool(os.environ.get("RENDER") or os.environ.get("STRATO") or os.environ.get("SERVER_MODE"))
-
-# CSV-Ordner klar trennen, damit du lokal & Server-Dateien nicht vermischst
-CSV_ROOT = "CSV_server" if SERVER_MODE else "CSV_local"
-os.makedirs(CSV_ROOT, exist_ok=True)
-
-def get_csv_filename(underlying):
-    # falls du die alte get_csv_filename() weiter unten hast: diese Version verwenden
-    return os.path.join(CSV_ROOT, f"hebel_{underlying.replace(' ', '_')}.csv")
-
-###Serverseitige Auto-Aufräumroutine (alle 30 Min)
-
-import threading, time
-
-def _cleanup_csv_folder(period_seconds=1800, max_age_minutes=45):
-    """Server: löscht CSV-Dateien, deren mtime älter als max_age_minutes ist."""
-    while True:
-        try:
-            now_ts = time.time()
-            max_age = max_age_minutes * 60
-            removed = 0
-            for fn in os.listdir(CSV_ROOT):
-                if not fn.lower().endswith(".csv"):
-                    continue
-                path = os.path.join(CSV_ROOT, fn)
-                try:
-                    mtime = os.path.getmtime(path)
-                    if now_ts - mtime > max_age:
-                        os.remove(path)
-                        removed += 1
-                except Exception:
-                    pass
-            if removed:
-                print(f"[CLEANUP] Entfernt: {removed} CSV (älter als {max_age_minutes} min)")
-        except Exception as e:
-            print(f"[CLEANUP] Fehler: {e}")
-        time.sleep(period_seconds)
-
 
 # --- Alarm-Konfiguration ---
 ALARM_FILE_SINGLE = os.path.join(os.path.dirname(__file__), "Alarm1.wav")
@@ -406,13 +290,14 @@ def get_driver() -> webdriver.Chrome:
     with _DRIVER_LOCK:
         if _DRIVER is not None:
             try:
+                # Lösche alle Cookies für eine frische Session
                 _DRIVER.delete_all_cookies()
-            except Exception:
+            except:
                 pass
         if _DRIVER is None:
-            _DRIVER = make_driver()
+            service = Service(ChromeDriverManager().install())
+            _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
         return _DRIVER
-
 
 def clean_ticker(symbol):
     return symbol.replace("$", "").strip()
@@ -472,7 +357,8 @@ def get_news_block(page_index=0):
     if not headlines:
         return html.Div("Keine News verfügbar", style={"color": "#666"})
     last_ts = _news_cache.get("ts", 0)
-    last_str = datetime.fromtimestamp(last_ts).strftime("%H:%M:%S") if last_ts else "-"
+    last_str = datetime.fromtimestamp(last_ts, tz=TZ_BERLIN).strftime("%H:%M:%S") if last_ts else "-"
+
     total = len(headlines)
     num_pages = max(1, math.ceil(total / NEWS_PAGE_SIZE))
     start = (page_index * NEWS_PAGE_SIZE) % total
@@ -526,7 +412,7 @@ def bewerte_rsi_ampel(rsi_value):
 CSV_FOLDER = "CSV"
 os.makedirs(CSV_FOLDER, exist_ok=True)
 
-scraper_start_time = datetime.now(pytz.timezone("Europe/Berlin")).strftime("%H:%M:%S")
+scraper_start_time = datetime.now(TZ_BERLIN).strftime("%H:%M:%S")
 
 persistenter_kommentar = ""
 persistenz_counter = 0
@@ -616,7 +502,7 @@ def _parse_german_percent(raw: str) -> float | None:
     if not raw:
         return None
     txt = raw.replace("\xa0", " ").strip()  # geschütztes Leerzeichen
-
+    import re
     m = re.search(r"-?\+?\d+(?:[.,]\d+)?", txt)
     if not m:
         return None
@@ -702,6 +588,7 @@ def _parse_german_percent(raw: str) -> float | None:
     if not raw:
         return None
     txt = raw.replace("\xa0", " ").strip()
+    import re
     m = re.search(r"-?\+?\d+(?:[.,]\d+)?", txt)
     if not m:
         return None
@@ -798,7 +685,7 @@ def log_index_event(timestamp, index_change):
             writer.writerow(["timestamp", "index_change"])
         writer.writerow([timestamp, index_change])
 
-@lru_cache(maxsize=8)
+
 def scrape_average_leverage(url_onvista, url_finanzen=None):
     """Liest durchschnittliche Hebelwerte ausschließlich von OnVista (kein Finanzen-Fallback)."""
     print(f"Versuche Daten von OnVista URL abzurufen: {url_onvista}")
@@ -959,7 +846,7 @@ def get_ampel1_status(df, selected_underlying):
         return FARBCODES["gray"], 0.5, f"Fehler in Ampel 1 Analyse: {e}"
 
 # === finanztreff.de Backup ===
-
+import re
 
 def _ft_accept_cookies(d, timeout=8):
     try:
@@ -1093,7 +980,7 @@ def get_vstoxx_change_stoxx():
         el = d.find_element(By.CSS_SELECTOR, "span.data-daily-change-percent")
         txt = el.text.strip()  # z.B. (+0.77%)
         # Zahl herausziehen
-        
+        import re
         m = re.search(r"([+-]?\d+[.,]\d+)\s*%", txt)
         if m:
             val = float(m.group(1).replace(",", "."))
@@ -1105,6 +992,7 @@ def get_vstoxx_change_stoxx():
 
 ############
 
+import re
 
 def _ft_accept_cookies_quick(d, timeout=8):
     try:
@@ -1155,7 +1043,7 @@ def get_vdax_change_finanztreff():
         print(f"⚠️ VDAX finanztreff Fallback fehlgeschlagen: {e}")
     return None
 
-import html as _html
+import re, html as _html
 
 _last_vstoxx_change_cache = None  # globaler Puffer
 
@@ -1210,54 +1098,37 @@ def update_data():
     while not stop_event.is_set():
         current_underlying = selected_underlying
         urls = UNDERLYINGS[current_underlying]
-
         long_avg = scrape_average_leverage(urls["long"])
         short_avg = scrape_average_leverage(urls["short"])
-
         index_data = get_index_data(current_underlying)
         index_change, index_display_value = (None, "-")
         if index_data and len(index_data) == 3:
             index_change, index_display_value, _ = index_data
 
         if index_change is None:
+               
             ft_change = get_index_change_from_finanztreff(current_underlying)
             if ft_change is not None:
                 index_change = ft_change
 
         vola_change = get_volatility_change(current_underlying)
         print(f"Volatility change for {current_underlying}: {vola_change}")
-
         if None not in (long_avg, short_avg, index_change) and abs(index_change) < 10:
             csv_file = get_csv_filename(current_underlying)
-
-            # Berliner Zeit verwenden
             new_data = pd.DataFrame([[
-                datetime.now(tz),  # tz = pytz.timezone("Europe/Berlin"), global definiert
-                long_avg,
-                short_avg,
-                index_change,
-                (short_avg / long_avg - 1) * 100 if (long_avg + short_avg) > 0 else None,
+                datetime.now(TZ_BERLIN), long_avg, short_avg, index_change,
+                (short_avg/long_avg-1)*100 if (long_avg + short_avg) > 0 else None,
                 vola_change
-            ]], columns=[
-                "timestamp", "long_avg", "short_avg",
-                "index_change", "short_vs_long_diff_prozent", "volatility_change"
-            ])
-
+            ]], columns=["timestamp","long_avg","short_avg","index_change","short_vs_long_diff_prozent","volatility_change"])
             if os.path.exists(csv_file):
                 df = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
-                if len(df) > 1000:
-                    df = df.iloc[-1000:]
+                if len(df) > 1000: df = df.iloc[-1000:]
                 df = pd.concat([df, new_data], ignore_index=True)
             else:
                 df = new_data
-
             df.to_csv(csv_file, index=False, encoding='utf-8', lineterminator='\n')
-
-            # ebenfalls Berliner Zeit für die Anzeige
-            last_fetch_time = datetime.now(tz).strftime("%H:%M:%S")
-
+            last_fetch_time = datetime.now(TZ_BERLIN).strftime("%H:%M:%S")
         time.sleep(refresh_interval)
-
 
 def start_update_thread():
     global update_thread, stop_event
@@ -1272,18 +1143,6 @@ def start_update_thread():
 def get_vol_label(selected_underlying):
     return {"Dax":"VDAX","S&P 500":"VIX","EURO STOXX 50":"VSTOXX","Dow Jones":"VXD","Nasdaq":"VXN"}.get(selected_underlying,"Volatilität")
 
-def poll_leverage(underlying):
-    global driver
-    try:
-        res = get_leverage_distribution(underlying, driver)
-        if res:
-            long_p, short_p = res
-            append_leverage_row(underlying, long_p, short_p)  # -> CSV/Cache
-            print(f"HEBEL OK {underlying}: Long={long_p:.2f} Short={short_p:.2f}")
-        else:
-            print(f"HEBEL FAIL {underlying}")
-    except Exception as e:
-        print("HEBEL EXC:", repr(e))
 
 
 
@@ -1326,7 +1185,7 @@ app.layout = html.Div([
         dcc.Input(id='interval-input', type='number', value=refresh_interval, min=5, step=1,
                   style={'width': '40px', "fontSize": "18px", "fontWeight": "bold","textAlign": "center"}),
         html.Button("Intervall ändern (Sek)", id="set-interval-btn", style={'marginLeft': '7px', "fontSize": "18px"}),
-        html.Button("Alle CSV löschen", id="reset-btn", style={'marginLeft': '7px', "fontSize": "18px"})
+        html.Button("Alle CSV löschen", id="reset-btn", style={'marginLeft': '7px', "fontSize": "18px"},disabled=IS_SERVER)
     ], style={'margin': '20px 0'}),
 
     # ---- Ton-Schalter (bereinigt) ----
@@ -1371,35 +1230,7 @@ def on_sound_toggle(value):
     set_sound_enabled(on)
     # zeigt Glocke an/aus im Kästchen
     return [{"label": "🔔" if on else "🔕", "value": "on"}]
-
-
-#Button-Callback so umbauen, dass er im Servermodus nichts löscht
-@app.callback(
-    Output("last-fetch-time", "children"),
-    Input("reset-btn", "n_clicks"),
-    State("underlying-dropdown", "value"),
-    prevent_initial_call=True
-)
-def on_reset_csv(n_clicks, selected):
-    if not n_clicks:
-        return no_update
-
-    if SERVER_MODE:
-        # Server: NICHT löschen – nur Info anzeigen
-        return f"CSV-Löschung auf Server deaktiviert (Schutz). Letzte Abfrage: {last_fetch_time}"
-    else:
-        # Lokal: wirklich löschen (alle CSV in diesem Root)
-        try:
-            removed = 0
-            for fn in os.listdir(CSV_ROOT):
-                if fn.lower().endswith(".csv"):
-                    os.remove(os.path.join(CSV_ROOT, fn))
-                    removed += 1
-            ts = datetime.now(tz).strftime("%H:%M:%S")
-            return f"Lokale CSV gelöscht ({removed} Dateien) um {ts}"
-        except Exception as e:
-            return f"Fehler beim Löschen: {e}"
-
+    
 
 
 
@@ -1505,8 +1336,7 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             margin=dict(l=50, r=50, b=50, t=80, pad=4), height=500, plot_bgcolor='rgba(240,240,240,0.8)'
         )
     else:
-        now = datetime.now(pytz.timezone("Europe/Berlin"))
-
+        now = datetime.now(TZ_BERLIN)
         placeholder_text = "Warte auf ausreichende Daten..." if len(df) == 1 else "Warte auf erste Daten..."
         fig.add_annotation(text=placeholder_text, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="gray"))
         fig.add_trace(go.Scatter(x=[now - timedelta(minutes=5), now], y=[0, 50], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='none'))
@@ -1653,34 +1483,14 @@ import os
     prevent_initial_call=True
 )
 def close_app(n_clicks):
-    if not n_clicks:
-        return no_update
+    if IS_SERVER:
+        # Auf Server: Klick ignorieren, nichts beenden
+        return "Leverage Lens"
+    os._exit(0)   # lokal: sofort beenden
 
-    # Prüfen: lokal oder Server
-    if "RENDER" in os.environ or "STRATO" in os.environ:
-        # Servermodus → tue nichts
-        return no_update
-    else:
-        # Lokaler Modus → wirklich beenden
-        os._exit(0)
+
 
 if __name__ == "__main__":
     start_update_thread()
-
-    if SERVER_MODE:
-        # Auto-Cleanup nur im Servermodus starten
-        threading.Thread(target=_cleanup_csv_folder, kwargs={"period_seconds": 1800, "max_age_minutes": 45}, daemon=True).start()
-
-
-
-    
-    # Port aus Umgebungsvariable für Cloud-Hosting (z.B. Render) oder lokal 8050
-    port = int(os.environ.get("PORT", 8050))
-    host = "0.0.0.0" if os.environ.get("PORT") else "127.0.0.1"
-    
-    # Nur lokal den Browser öffnen
-    if host == "127.0.0.1":
-        threading.Timer(0.8, lambda: webbrowser.open(f"http://{host}:{port}")).start()
-    
-    app.run(debug=False, host=host, port=port)
-
+    threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+    app.run(debug=False, host="127.0.0.1", port=8050)
