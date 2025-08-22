@@ -87,7 +87,21 @@ from datetime import datetime
 
 TZ_BERLIN = pytz.timezone("Europe/Berlin")
 
+def make_driver():
+    opts = Options()
+    opts.add_argument("--headless=new")     # Server/CI
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
 
+    # Falls du garantiert Chromium (nicht Google Chrome) nutzt:
+    if os.path.exists("/usr/bin/chromium"):
+        opts.binary_location = "/usr/bin/chromium"
+
+    # WICHTIG: keinen executable_path setzen, keinen alten Pfad übergeben!
+    service = Service()  # <- Selenium Manager kümmert sich um den passenden Treiber
+
+    driver = webdriver.Chrome(service=service, options=opts)
+    return driver
 
 
 # --- VSTOXX (stock3) robust ---
