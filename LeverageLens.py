@@ -1463,10 +1463,32 @@ def close_app(n_clicks):
     os._exit(0)   # beendet das Programm sofort
 
 server = app.server
+# --- App-Start (lokal & Render) -----------------------------------
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=warmup_or_fetch, daemon=True).start()
-    app.run_server(host="0.0.0.0", port=int(os.environ["PORT"]), debug=False)
+    import os, sys, threading
+
+    # (optional) Commit-Print für Render-Logs
+    print("LeverageLens START COMMIT:",
+          os.environ.get("RENDER_GIT_COMMIT", "unknown"),
+          file=sys.stderr, flush=True)
+
+    # optionaler Hintergrund-Task, nur wenn vorhanden
+    bg_target = globals().get("warmup_or_fetch")
+    if callable(bg_target):
+        threading.Thread(target=bg_target, daemon=True).start()
+
+    # lokal & Render kompatibel
+    port  = int(os.getenv("PORT", 8050))          # Render setzt PORT
+    host  = os.getenv("HOST", "0.0.0.0")          # 0.0.0.0 funktioniert lokal & im Container
+    debug = os.getenv("DASH_DEBUG", "1") == "1"   # lokal bequem debuggen
+
+    # falls du gunicorn nutzen willst, ist 'server = app.server' praktisch:
+    try:
+        server = app.server
+    except Exception:
+        pass
+
+    app.run_server(host=host, port=port, debug=debug)
 
 
 
