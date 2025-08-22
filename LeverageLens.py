@@ -6,7 +6,8 @@ required_modules = {
     "dash": "dash",
     "selenium": "selenium",
     "yfinance": "yfinance",
-    "simpleaudio": "simpleaudio"
+    "simpleaudio": "simpleaudio",
+    "webdriver_manager": "webdriver-manager",   # <— NEU
 }
 
 fehlende_module = []
@@ -56,7 +57,6 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import tempfile, shutil, atexit
 from datetime import timedelta
 import yfinance as yf
@@ -68,10 +68,10 @@ from datetime import datetime
 import plotly.io as pio
 from threading import Lock
 import threading, time
+import re
 import os, sys
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 from selenium.common.exceptions import (
@@ -85,6 +85,72 @@ tz = pytz.timezone("Europe/Berlin")
 
 # --- VSTOXX (stock3) robust ---
 _last_vstoxx_change = None
+
+def get_leverage_distribution(underlying: str, driver) -> tuple[float,float] | None:
+    url = UNDERLYING_URLS.get(underlying)
+    if not url:
+        print(f"❌ Kein URL-Mapping für {underlying}")
+        return None
+    driver.get(url)
+
+    # Cookie-Banner wegklicken (Onetrust/Consent-Varianten)
+    try:
+        for selector in [
+            "#onetrust-accept-btn-handler",
+            "button[aria-label='Zustimmen']",
+            "button[title='Akzeptieren']",
+            "button:contains('Akzeptieren')",
+        ]:
+            try:
+                btn = WebDriverWait(driver, 3).until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                btn.click()
+                break
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Warte auf irgendeinen inhaltlichen Container der KO-Suche
+    try:
+        WebDriverWait(driver, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #app, div"))
+        )
+        time.sleep(0.8)  # DOM settle
+    except Exception:
+        pass
+
+    html = driver.page_source
+
+    # 1) Versuch: explizite Prozent-Anzeige "Long xx,xx %", "Short yy,yy %"
+    m = re.search(r"Long[^0-9]+([0-9]{1,2}[,\.\s]?[0-9]{0,2})\s*%", html, re.I)
+    n = re.search(r"Short[^0-9]+([0-9]{1,2}[,\.\s]?[0-9]{0,2})\s*%", html, re.I)
+    if m and n:
+        long_p = float(m.group(1).replace(",", ".").replace(" ", ""))
+        short_p = float(n.group(1).replace(",", ".").replace(" ", ""))
+        print(f"✔️ Hebel gefunden (Text): Long={long_p:.2f}% Short={short_p:.2f}%")
+        return long_p, short_p
+
+    # 2) Versuch: Summen aus Tabellen (z. B. Anzahl Long vs Short)
+    try:
+        rows = driver.find_elements(By.CSS_SELECTOR, "table tr")
+        long_cnt = sum(1 for r in rows if re.search(r"long", r.text, re.I))
+        short_cnt = sum(1 for r in rows if re.search(r"short", r.text, re.I))
+        total = long_cnt + short_cnt
+        if total >= 5:  # Schwelle, damit Mini-Listen nicht rauschen
+            long_p = round(100.0 * long_cnt / total, 2)
+            short_p = round(100.0 * short_cnt / total, 2)
+            print(f"✔️ Hebel aus Zeilen: Long={long_p:.2f}% Short={short_p:.2f}% (N={total})")
+            return long_p, short_p
+    except Exception:
+        pass
+
+    # 3) Nichts gefunden ⇒ Snapshot zur Diagnose
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    with open(f"logs/hebel_snapshot_{underlying}_{ts}.html", "w", encoding="utf-8") as f:
+        f.write(html[:500000])
+    print(f"❌ Keine Hebel gefunden – Snapshot gespeichert (logs/hebel_snapshot_{underlying}_{ts}.html)")
+    return None
+
 
 def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
     """
@@ -142,30 +208,36 @@ _SOUND_LOCK = Lock()
 
 import os, subprocess
 
-def make_driver() -> webdriver.Chrome:
-    chrome_bin = os.getenv("CHROME_BIN", "/usr/bin/chromium")
-    driver_bin = os.getenv("CHROMEDRIVER", "/usr/bin/chromedriver")
-
-    # Debug-Ausgabe, damit du im Log siehst, was wirklich genutzt wird
+def make_driver():
+    import random
+    UAS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124 Safari/537.36",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125 Safari/537.36",
+    ]
+    ua = random.choice(UAS)
     try:
-        print(subprocess.getoutput(f"{chrome_bin} --version"), flush=True)
-        print(subprocess.getoutput(f"{driver_bin} --version"), flush=True)
+        import undetected_chromedriver as uc
+        from selenium.webdriver.chrome.options import Options
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument(f"--user-agent={ua}")
+        opts.add_argument("--lang=de-DE")
+        return uc.Chrome(options=opts)
     except Exception:
-        pass
+        from selenium import webdriver
+        from selenium.webdriver.chrome.service import Service
+        from selenium.webdriver.chrome.options import Options
+        from webdriver_manager.chrome import ChromeDriverManager
+        opts = Options()
+        opts.add_argument("--headless=new")
+        opts.add_argument("--no-sandbox")
+        opts.add_argument("--disable-dev-shm-usage")
+        opts.add_argument(f"--user-agent={ua}")
+        opts.add_argument("--lang=de-DE")
+        return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opts)
 
-    opts = _make_chrome_options()
-    try:
-        opts.binary_location = chrome_bin    
-    except Exception:
-        pass    
-        
-    opts.binary_location = chrome_bin
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-
-    service = Service(driver_bin)
-    return webdriver.Chrome(service=service, options=opts)
 
 
 def set_sound_enabled(val: bool):
@@ -544,7 +616,7 @@ def _parse_german_percent(raw: str) -> float | None:
     if not raw:
         return None
     txt = raw.replace("\xa0", " ").strip()  # geschütztes Leerzeichen
-    import re
+
     m = re.search(r"-?\+?\d+(?:[.,]\d+)?", txt)
     if not m:
         return None
@@ -630,7 +702,6 @@ def _parse_german_percent(raw: str) -> float | None:
     if not raw:
         return None
     txt = raw.replace("\xa0", " ").strip()
-    import re
     m = re.search(r"-?\+?\d+(?:[.,]\d+)?", txt)
     if not m:
         return None
@@ -888,7 +959,7 @@ def get_ampel1_status(df, selected_underlying):
         return FARBCODES["gray"], 0.5, f"Fehler in Ampel 1 Analyse: {e}"
 
 # === finanztreff.de Backup ===
-import re
+
 
 def _ft_accept_cookies(d, timeout=8):
     try:
@@ -1022,7 +1093,7 @@ def get_vstoxx_change_stoxx():
         el = d.find_element(By.CSS_SELECTOR, "span.data-daily-change-percent")
         txt = el.text.strip()  # z.B. (+0.77%)
         # Zahl herausziehen
-        import re
+        
         m = re.search(r"([+-]?\d+[.,]\d+)\s*%", txt)
         if m:
             val = float(m.group(1).replace(",", "."))
@@ -1034,7 +1105,6 @@ def get_vstoxx_change_stoxx():
 
 ############
 
-import re
 
 def _ft_accept_cookies_quick(d, timeout=8):
     try:
@@ -1085,7 +1155,7 @@ def get_vdax_change_finanztreff():
         print(f"⚠️ VDAX finanztreff Fallback fehlgeschlagen: {e}")
     return None
 
-import re, html as _html
+import html as _html
 
 _last_vstoxx_change_cache = None  # globaler Puffer
 
@@ -1202,6 +1272,18 @@ def start_update_thread():
 def get_vol_label(selected_underlying):
     return {"Dax":"VDAX","S&P 500":"VIX","EURO STOXX 50":"VSTOXX","Dow Jones":"VXD","Nasdaq":"VXN"}.get(selected_underlying,"Volatilität")
 
+def poll_leverage(underlying):
+    global driver
+    try:
+        res = get_leverage_distribution(underlying, driver)
+        if res:
+            long_p, short_p = res
+            append_leverage_row(underlying, long_p, short_p)  # -> CSV/Cache
+            print(f"HEBEL OK {underlying}: Long={long_p:.2f} Short={short_p:.2f}")
+        else:
+            print(f"HEBEL FAIL {underlying}")
+    except Exception as e:
+        print("HEBEL EXC:", repr(e))
 
 
 
