@@ -1462,8 +1462,11 @@ import os
 def close_app(n_clicks):
     os._exit(0)   # beendet das Programm sofort
 
-
+server = app.server
 if __name__ == "__main__":
-    start_update_thread()
-    threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
-    app.run(debug=False, host="127.0.0.1", port=8050)
+    import threading
+    threading.Thread(target=warmup_or_fetch, daemon=True).start()
+    app.run_server(host="0.0.0.0", port=int(os.environ["PORT"]), debug=False)
+
+
+
