@@ -58,7 +58,11 @@ from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-from webdriver_manager.core.utils import ChromeType
+# Try both possible locations for ChromeType
+try:
+    from webdriver_manager.core.os_manager import ChromeType
+except ImportError:
+    from webdriver_manager.core.utils import ChromeType
 from selenium.webdriver.chrome.options import Options
 import tempfile, shutil, atexit
 from datetime import timedelta
