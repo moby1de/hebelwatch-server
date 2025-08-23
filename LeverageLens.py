@@ -1,4 +1,4 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v60 #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v61 SOFR #
 # Kontrolle bei Programmstart - notwendige Module
 
 required_modules = {
@@ -87,7 +87,61 @@ from datetime import datetime
 
 TZ_BERLIN = pytz.timezone("Europe/Berlin")
 
+# für Ampel 2 erweiterung########
 
+# --- SOFR-Proxy (TED ersatz) --------------------------------------------------
+FRED_API_KEY = "ac24c6331bbe4bd92e5cc0ce443d4d2e"
+_FRED_URL = "https://api.stlouisfed.org/fred/series/observations"
+_SOFR_CACHE = {"ts": 0, "bps": None, "text": "SOFR-Proxy: keine Daten."}
+
+def _fred_last(series_id, days=14):
+    """Letzte gültige Beobachtung als float (% p.a.)."""
+    import pandas as pd, datetime as _dt
+    if not FRED_API_KEY:
+        return None
+    end = _dt.date.today()
+    start = end - _dt.timedelta(days=days)
+    p = {"series_id": series_id, "file_type": "json",
+         "observation_start": start.isoformat(), "observation_end": end.isoformat(),
+         "api_key": FRED_API_KEY}
+    r = requests.get(_FRED_URL, params=p, timeout=15); r.raise_for_status()
+    obs = r.json().get("observations", [])
+    vals = [o.get("value") for o in obs if o.get("value") not in (".", None)]
+    if not vals: return None
+    try: return float(vals[-1])
+    except: return None
+
+def get_sofr_proxy_comment(cache_sec=1800):
+    """Gibt (bps:int, text:str). Cacht für cache_sec Sekunden."""
+    import time
+    now = time.time()
+    if now - _SOFR_CACHE["ts"] < cache_sec and _SOFR_CACHE["bps"] is not None:
+        return _SOFR_CACHE["bps"], _SOFR_CACHE["text"]
+
+    sofr = _fred_last("SOFR")              # Overnight SOFR, % p.a.
+    tb3m = _fred_last("DGS3MO") or _fred_last("TB3MS")  # 3M T-Bill, % p.a.
+    if sofr is None or tb3m is None:
+        return _SOFR_CACHE["bps"] or 0, "SOFR-Proxy: keine Daten."
+
+    spread_pp = sofr - tb3m
+    bps = int(round(spread_pp * 100))
+  #  bps = 45 # Test SOFR Override   5 45 75
+
+    # Kategorie-Text gemäß deiner Skala
+    if abs(bps) > 100:
+        txt = "Extrem (Systemkrise): >100 bps – Historisch nur in Krisen (2007 Bankenkrise bis 465 bps, Corona 2020 140 bps)."
+    elif abs(bps) >= 70:
+        txt = "Kritisch (Liquiditätsstress): 70–100 bps – Banken leihen zögerlich. Meist Vorbote stärkerer Abverkäufe."
+    elif abs(bps) >= 40:
+        txt = "Erhöht (Interbankmarkt wird nervös): 40–70 bps – Frühwarnsignal für knapper werdende Liquidität."
+    elif abs(bps) >= 10:
+        txt = "Normalbereich (kein Stress): 10–40 bps – Typisch in ruhigen Marktphasen."
+    else:
+        txt = "Unter Normalbereich (<10 bps) – sehr ruhige Interbank-Lage."
+
+    _SOFR_CACHE.update({"ts": now, "bps": bps, "text": txt})
+    return bps, txt
+##################################################################################################
 
 
 # --- VSTOXX (stock3) robust ---
@@ -175,6 +229,7 @@ def resource_path(rel_path: str) -> str:
     if hasattr(sys, "_MEIPASS"):
         return os.path.join(sys._MEIPASS, rel_path)
     return os.path.join(os.path.dirname(__file__), rel_path)        
+    
 
 # --- Alarm-Konfiguration ---
 ALARM_FILE_SINGLE = os.path.join(os.path.dirname(__file__), "Alarm1.wav")
@@ -279,19 +334,6 @@ def accept_cookies_if_present(d, timeout=6):
         pass
 
 
-
-def get_driver() -> webdriver.Chrome:
-    global _DRIVER
-    with _DRIVER_LOCK:
-        if _DRIVER is not None:
-            try:
-                _DRIVER.delete_all_cookies()
-            except:
-                pass
-        if _DRIVER is None:
-            service = Service(ChromeDriverManager().install())
-            _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
-        return _DRIVER
 
 def clean_ticker(symbol):
     return symbol.replace("$", "").strip()
@@ -1117,6 +1159,8 @@ def get_vol_label(selected_underlying):
 
 
 # -----------------------------------------------
+# -----------------------------------------------
+# -----------------------------------------------
 # Layout
 # -----------------------------------------------
 app.layout = html.Div([
@@ -1138,8 +1182,8 @@ app.layout = html.Div([
     html.Div(
         dcc.Dropdown(
             id='underlying-dropdown',
-            options=[{'label': k, 'value': k} for k in UNDERLYINGS.keys()],
-            value=selected_underlying,
+            options=[{'label': 'Dax', 'value': 'Dax'}],
+            value='Dax',
             style={"width": "300px","fontWeight": "bold","fontSize": "22px"}
         ),
         style={"display": "flex","justifyContent": "center","margin": "19px 0"}
@@ -1169,13 +1213,13 @@ app.layout = html.Div([
         dcc.Checklist(
             id="sound-toggle",
             options=[{"label": "🔔", "value": "on"}],
-            value=["on"],  # Standard: an
+            value=["on"],
             inline=True,
             persistence=True,
             persistence_type="local",
             style={"fontSize": "18px"}
         ),
-   ], style={'marginTop': '10px'}),
+    ], style={'marginTop': '10px'}),
 
     # Volatilitäts-Schalter
     html.Div(
@@ -1190,11 +1234,9 @@ app.layout = html.Div([
     ),
 
     dcc.Graph(id='leverage-graph'),
-
     dcc.Interval(id='interval-component', interval=refresh_interval * 1000, n_intervals=0),
-
-    html.Audio(id="alarm-audio", src="", autoPlay=True, controls=False, style={"display": "none"}),
-])
+    html.Audio(id="alarm-audio", src="", autoPlay=True, controls=False, style={"display": "none"})
+])  # Closing the main html.Div
 
 # ---- Sound-Status Callback (einzig) ----
 @app.callback(
@@ -1332,6 +1374,50 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             ampel2_color = FARBCODES["red"]
         else:
             ampel2_color = FARBCODES["gray"]
+            
+# --- SOFR-Proxy-Werte holen -      
+      
+        sofr_bps, _ = get_sofr_proxy_comment()  
+        
+        if sofr_bps is None:
+            sofr_bps = 0
+            sofr_text = "SOFR-Proxy: keine Daten."
+            
+        else:
+            if abs(sofr_bps) > 100:
+                sofr_text = "Extrem (Systemkrise): >100 bps – Historisch nur in Krisen (2007–2008 bis 465 bps, Corona 2020 ca. 140 bps). Signal: akute Banken-/Fundingkrise."
+            elif abs(sofr_bps) >= 70:
+                sofr_text = "Kritisch (Liquiditätsstress): 70–100 bps – Banken leihen zögerlich. Meist Vorbote stärkerer Abverkäufe."
+            elif abs(sofr_bps) >= 40:
+                sofr_text = "Erhöht (Markt wird nervös): 40–70 bps – Leichte Spannungen im Interbankmarkt. Frühwarnsignal für knapper werdende Liquidität."
+            elif abs(sofr_bps) >= 10:
+                sofr_text = "Normalbereich (kein Stress): 10–40 bps – Typisch in ruhigen Marktphasen."
+            else:
+                sofr_text = "Unter Normalbereich (<10 bps) – sehr ruhige Interbank-Lage."    
+        
+            
+            
+            
+            #
+# Miniampel/Farbe bestimmen
+        if abs(sofr_bps) >= 70:
+            sofr_mini_color = FARBCODES["red"]
+            sofr_mini_emoji = "🔴"
+        elif abs(sofr_bps) >= 40:
+            sofr_mini_color = FARBCODES["orange"]
+            sofr_mini_emoji = "🟠"
+        else:
+            sofr_mini_color = FARBCODES["green"]
+            sofr_mini_emoji = "🟢"
+# Ampel 2 hart überschreiben, wenn Stress hoch        
+        if abs(sofr_bps) >= 70:
+            ampel2_color = FARBCODES["red"]
+        elif abs(sofr_bps) >= 40 and ampel2_color != FARBCODES["red"]:
+            ampel2_color = FARBCODES["orange"]
+              
+    # nur gelb markieren, falls nicht bereits rot aus anderer Logik
+      
+            
 
         # Browser-Alarm nur bei Zustandswechsel und nur wenn sound_on
         amp1_rot = (ampel1_color == FARBCODES["red"])
@@ -1371,7 +1457,8 @@ def update_graph(n, selected, volatility_toggle, sound_value):
         html.Div(tagesverlauf, style={"fontStyle": "normal","fontSize": "90%","color": "#333","backgroundColor": "#e0e0e0","padding": "4px 8px","borderRadius": "6px","display": "inline-block","marginBottom": "20px"}),
     ], style={"marginBottom": "16px"})
 
-    # Rückgabe
+
+    
     return (
         fig,
         f"Letzte Abfrage: {last_fetch_time}",
@@ -1396,7 +1483,12 @@ def update_graph(n, selected, volatility_toggle, sound_value):
                     html.Div(f"Ampel 2: Hebel Watch - Banken Trendfrüherkennung: Long oder Short? (5 bis 30 Minuten)", style={"fontSize": "100%","fontWeight": "bold"}),
                     html.Div("Erkennt: ob Banken verstärkt Longs oder Shorts anbieten, also wo sie - in diesem Augenblick - Risiken sehen", style={"marginLeft": "20px","fontSize": "90%","color": "#333","fontStyle": "normal"}),
                     html.Div(f"Kommentar: {kommentar}", style={"marginLeft": "40px","fontSize": "90%","color": "#333","fontStyle": "normal"}),
-                ])
+                    html.Div([
+                        html.Span(sofr_mini_emoji, style={"marginRight": "6px"}),
+                        html.Span(f"SOFR-Spread: {sofr_bps} bps – {sofr_text}")
+                    ], style={"marginLeft": "40px","fontSize": "90%","color": "#333","fontStyle": "normal"}),
+    ])
+         #       ])
             ], style={"display": "flex","alignItems": "flex-start","marginBottom": "20px"}),
             html.Div([
                 html.Div(style={"width": "35px","height": "35px","borderRadius": "50%","backgroundColor": ampel3_color,"display": "inline-block","marginRight": "15px","marginTop": "4px","boxShadow": "0 0 8px 2px rgba(255, 255, 255, 0.5)","border": "2px solid #666","boxSizing": "border-box"}),
