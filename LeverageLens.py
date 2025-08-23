@@ -58,11 +58,6 @@ from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
-# Try both possible locations for ChromeType
-try:
-    from webdriver_manager.core.os_manager import ChromeType
-except ImportError:
-    from webdriver_manager.core.utils import ChromeType
 from selenium.webdriver.chrome.options import Options
 import tempfile, shutil, atexit
 from datetime import timedelta
@@ -151,8 +146,19 @@ def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
 _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 
-def get_driver_from_pool():
-    return driver_pool.submit(_create_driver).result()
+def get_driver() -> webdriver.Chrome:
+    global _DRIVER
+    with _DRIVER_LOCK:
+        if _DRIVER is not None:
+            try:
+                # Lösche alle Cookies für eine frische Session
+                _DRIVER.delete_all_cookies()
+            except:
+                pass
+        if _DRIVER is None:
+            service = Service(ChromeDriverManager().install())
+            _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
+        return _DRIVER
 
 
 def set_sound_enabled(val: bool):
@@ -236,15 +242,13 @@ def _make_chrome_options() -> Options:
     opts.add_argument("--headless=new")
     opts.add_argument("--disable-blink-features=AutomationControlled")
     opts.add_argument("--window-size=1280,900")
-    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
     opts.add_argument("--disable-gpu")
     opts.add_argument("--disable-software-rasterizer")
     opts.add_argument("--disable-logging")
     opts.add_argument("--log-level=3")
     opts.add_experimental_option('excludeSwitches', ['enable-logging'])
-
     return opts
-
 
 
 def accept_cookies_if_present(d, timeout=6):
@@ -281,12 +285,11 @@ def get_driver() -> webdriver.Chrome:
     with _DRIVER_LOCK:
         if _DRIVER is not None:
             try:
-                # Lösche alle Cookies für eine frische Session
                 _DRIVER.delete_all_cookies()
             except:
                 pass
         if _DRIVER is None:
-            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
+            service = Service(ChromeDriverManager().install())
             _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
         return _DRIVER
 
@@ -648,7 +651,15 @@ def get_vstoxx_change() -> float | None:
 
 
 def get_csv_filename(underlying):
-    return os.path.join(CSV_FOLDER, f"hebel_{underlying.replace(' ', '_')}.csv")
+    # In EXE: CSV im gleichen Verzeichnis wie EXE speichern
+    if hasattr(sys, '_MEIPASS'):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        base_dir = os.path.dirname(__file__)
+    
+    csv_dir = os.path.join(base_dir, "CSV")
+    os.makedirs(csv_dir, exist_ok=True)
+    return os.path.join(csv_dir, f"hebel_{underlying.replace(' ', '_')}.csv")
 
 def log_ampel_event(timestamp, delta_long, delta_short, ampel, kommentar):
     filename = os.path.join(CSV_FOLDER, "log_ampel.csv")
@@ -1109,13 +1120,20 @@ def get_vol_label(selected_underlying):
 # Layout
 # -----------------------------------------------
 app.layout = html.Div([
-    html.H1("Leverage Lens", id="exit-title", style={
-        "fontSize": "56px","fontWeight": "bold","textAlign": "center",
-        "background": "linear-gradient(90deg, red, orange, yellow, green, blue, violet)",
-        "WebkitBackgroundClip": "text","WebkitTextFillColor": "transparent",
-        "cursor": "pointer"   # ← Mauszeiger wird zur Hand
-    }),
-
+    html.Div([
+        html.H1("Leverage Lens", id="exit-title", style={
+            "fontSize": "56px", "fontWeight": "bold", "textAlign": "center",
+            "background": "linear-gradient(90deg, red, orange, yellow, green, blue, violet)",
+            "WebkitBackgroundClip": "text", "WebkitTextFillColor": "transparent",
+            "cursor": "pointer", "display": "inline-block", "marginRight": "10px"
+        }),
+        html.Span("v60", style={
+            "fontSize": "16px",
+            "color": "#666",
+            "verticalAlign": "super",
+            "fontWeight": "normal"
+        })
+    ], style={"textAlign": "center", "marginBottom": "20px"}),
 
     html.Div(
         dcc.Dropdown(
@@ -1145,7 +1163,7 @@ app.layout = html.Div([
         html.Button("Intervall ändern (Sek)", id="set-interval-btn", style={'marginLeft': '7px', "fontSize": "18px"}),
         html.Button("Alle CSV löschen", id="reset-btn", style={'marginLeft': '7px', "fontSize": "18px"})
     ], style={'margin': '20px 0'}),
-
+    
     # ---- Ton-Schalter (bereinigt) ----
     html.Div([
         dcc.Checklist(
