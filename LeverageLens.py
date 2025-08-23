@@ -58,6 +58,7 @@ from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
+from webdriver_manager.core.utils import ChromeType
 from selenium.webdriver.chrome.options import Options
 import tempfile, shutil, atexit
 from datetime import timedelta
@@ -281,7 +282,7 @@ def get_driver() -> webdriver.Chrome:
             except:
                 pass
         if _DRIVER is None:
-            service = Service(ChromeDriverManager().install())
+            service = Service(ChromeDriverManager(chrome_type=ChromeType.CHROMIUM).install())
             _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
         return _DRIVER
 
