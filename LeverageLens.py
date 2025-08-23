@@ -1,6 +1,6 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 22.08.2025 v59 #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v60 #
 # Kontrolle bei Programmstart - notwendige Module
-import sys
+
 required_modules = {
     "pandas": "pandas",
     "dash": "dash",
@@ -59,11 +59,9 @@ from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 import tempfile, shutil, atexit
 from datetime import timedelta
+import gc
 import yfinance as yf
 from functools import lru_cache
 import math
@@ -71,12 +69,14 @@ import pytz
 from datetime import datetime
 import plotly.io as pio
 from threading import Lock
+import re
 import os, sys
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
+from concurrent.futures import ThreadPoolExecutor
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+driver_pool = ThreadPoolExecutor(max_workers=2)  # Nur 2 gleichzeitige Driver
 from selenium.common.exceptions import (
     StaleElementReferenceException,
     TimeoutException,
@@ -146,7 +146,8 @@ def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
 _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 
-
+def get_driver_from_pool():
+    return driver_pool.submit(_create_driver).result()
 
 
 def set_sound_enabled(val: bool):
@@ -287,7 +288,7 @@ def get_driver() -> webdriver.Chrome:
 def clean_ticker(symbol):
     return symbol.replace("$", "").strip()
 
-import pandas as pd
+
 
 def safe_concat(dfs, **kwargs):
     cleaned = []
@@ -487,7 +488,7 @@ def _parse_german_percent(raw: str) -> float | None:
     if not raw:
         return None
     txt = raw.replace("\xa0", " ").strip()  # geschütztes Leerzeichen
-    import re
+    
     m = re.search(r"-?\+?\d+(?:[.,]\d+)?", txt)
     if not m:
         return None
@@ -568,21 +569,13 @@ def get_index_data(underlying):
         print(f"Fehler bei Yahoo-Finance-Abfrage: {e}")
         return None, "-", "gray"
 
-def _parse_german_percent(raw: str) -> float | None:
-    """Wandelt '0,85 %' → 0.85"""
-    if not raw:
-        return None
-    txt = raw.replace("\xa0", " ").strip()
-    import re
-    m = re.search(r"-?\+?\d+(?:[.,]\d+)?", txt)
-    if not m:
-        return None
-    val = m.group(0).replace(".", "").replace(",", ".").replace("+", "")
-    try:
-        return float(val)
-    except ValueError:
-        return None
 
+def cleanup_memory():
+    gc.collect()
+    # WebDriver-Cache leeren
+    if _DRIVER:
+        _DRIVER.execute_script("window.open('','_blank').close()")
+        _DRIVER.execute_script("window.location.reload(true)")
 
 def get_volatility_change(underlying):
     """
@@ -831,7 +824,7 @@ def get_ampel1_status(df, selected_underlying):
         return FARBCODES["gray"], 0.5, f"Fehler in Ampel 1 Analyse: {e}"
 
 # === finanztreff.de Backup ===
-import re
+
 
 def _ft_accept_cookies(d, timeout=8):
     try:
@@ -949,35 +942,10 @@ def _stoxx_accept_cookies(d, timeout=10):
         pass
 
 
-def get_vstoxx_change_stoxx():
-    """
-    Fallback für VSTOXX von stoxx.com (siehe Screenshot).
-    Liest den Prozentwert aus <span class="data-daily-change-percent">(+0.77%)</span>
-    Rückgabe: float oder None.
-    """
-    try:
-        d = get_driver()
-        d.get("https://www.stoxx.com/index/v2tx/")
-        _stoxx_accept_cookies(d)
-        WebDriverWait(d, 20).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "span.data-daily-change-percent"))
-        )
-        el = d.find_element(By.CSS_SELECTOR, "span.data-daily-change-percent")
-        txt = el.text.strip()  # z.B. (+0.77%)
-        # Zahl herausziehen
-        import re
-        m = re.search(r"([+-]?\d+[.,]\d+)\s*%", txt)
-        if m:
-            val = float(m.group(1).replace(",", "."))
-            print(f"✔️ VSTOXX (stoxx.com) Veränderung: {val:.2f} %")
-            return val
-    except Exception as e:
-        print(f"⚠️ VSTOXX stoxx.com Fallback fehlgeschlagen: {e}")
-    return None
 
 ############
 
-import re
+
 
 def _ft_accept_cookies_quick(d, timeout=8):
     try:
@@ -1028,7 +996,7 @@ def get_vdax_change_finanztreff():
         print(f"⚠️ VDAX finanztreff Fallback fehlgeschlagen: {e}")
     return None
 
-import re, html as _html
+import html as _html
 
 _last_vstoxx_change_cache = None  # globaler Puffer
 
@@ -1474,7 +1442,6 @@ def cleanup():
 atexit.register(cleanup)
 
 import webbrowser, threading
-import os
 
 @app.callback(
     Output("exit-title", "children"),
