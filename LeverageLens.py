@@ -383,8 +383,10 @@ def get_top_news(max_items=9, cache_seconds=60):
     now = time.time()
     if now - _news_cache["ts"] < cache_seconds and _news_cache["items"]:
         return _news_cache["items"]
-    rss_url = "https://www.tagesschau.de/wirtschaft/finanzen/index~rss2.xml"
+    rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
+   #rss_url = "https://www.tagesschau.de/wirtschaft/finanzen/index~rss2.xml"
     #rss_url = "https://www.finanztreff.de/feed/marktberichte.rss"
+    #rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
     try:
         r = requests.get(rss_url, timeout=10)
         r.raise_for_status()
@@ -417,7 +419,7 @@ def get_news_block(page_index=0):
     page_info = f" {page_index + 1}/{num_pages}"
     return html.Div([
         html.Div([
-            html.Span(f"Top-Börsennachrichten (ard.de) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
+            html.Span(f"Top-Börsennachrichten (Börse Frankfurt-News) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
            #html.Span(f"Top-Börsennachrichten (finanztreff.de) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
             html.Span(f"Stand: {last_str}", style={"color": "#555", "fontSize": "90%", "display": "block"})
         ], style={"marginBottom": "10px"}),
