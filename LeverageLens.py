@@ -1,4 +1,5 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v61 SOFR #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v61 
+# SOFR +Öffnungszeit update #
 # Kontrolle bei Programmstart - notwendige Module
 
 required_modules = {
@@ -271,6 +272,12 @@ MARKET_TIMES = {
     "EUROPE": {"start": {"hour": 9, "minute": 0}, "end": {"hour": 17, "minute": 30}},
 }
 
+# direkt UNTER MARKET_TIMES einfügen
+HOLIDAYS_FIXED = {
+    "EUROPE": {(1, 1), (12, 25), (12, 26)},   # Neujahr, 1./2. Weihnachtsfeiertag
+    "USA":    {(1, 1), (7, 4),  (12, 25)},    # New Year, Independence Day, Christmas
+}
+
 def is_market_open(underlying):
     tz = pytz.timezone('Europe/Berlin')
     now = datetime.now(tz)
@@ -278,9 +285,15 @@ def is_market_open(underlying):
     start_time = MARKET_TIMES[market]["start"]
     end_time = MARKET_TIMES[market]["end"]
     start_dt = now.replace(hour=start_time["hour"], minute=start_time["minute"], second=0, microsecond=0)
-    end_dt = now.replace(hour=end_time["hour"], minute=end_time["minute"], second=0, microsecond=0)
+    end_dt   = now.replace(hour=end_time["hour"],   minute=end_time["minute"],   second=0, microsecond=0)
     market_hours = f"{start_time['hour']:02d}:{start_time['minute']:02d}-{end_time['hour']:02d}:{end_time['minute']:02d} Uhr MEZ"
+
+    # Wochenende oder fester Feiertag -> geschlossen
+    if now.weekday() >= 5 or (now.month, now.day) in HOLIDAYS_FIXED.get(market, set()):
+        return f"❌ Börse geschlossen ({market_hours})"
+
     return f"✅ Börse geöffnet ({market_hours})" if start_dt <= now <= end_dt else f"❌ Börse geschlossen ({market_hours})"
+
 
 # ==== WebDriver-Setup ====
 _DRIVER = None
@@ -1171,7 +1184,7 @@ app.layout = html.Div([
             "WebkitBackgroundClip": "text", "WebkitTextFillColor": "transparent",
             "cursor": "pointer", "display": "inline-block", "marginRight": "10px"
         }),
-        html.Span("v60", style={
+        html.Span("v61", style={
             "fontSize": "16px",
             "color": "#666",
             "verticalAlign": "super",
@@ -1182,8 +1195,8 @@ app.layout = html.Div([
     html.Div(
         dcc.Dropdown(
             id='underlying-dropdown',
-            options=[{'label': 'Dax', 'value': 'Dax'}],
-            value='Dax',
+            options=[{'label': k, 'value': k} for k in UNDERLYINGS.keys()],
+            value=selected_underlying,
             style={"width": "300px","fontWeight": "bold","fontSize": "22px"}
         ),
         style={"display": "flex","justifyContent": "center","margin": "19px 0"}
