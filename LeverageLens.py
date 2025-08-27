@@ -1,4 +1,5 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v61 SOFR #
+# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v64
+# SOFR +Öffnungszeit update #
 # Kontrolle bei Programmstart - notwendige Module
 
 required_modules = {
@@ -67,12 +68,19 @@ from functools import lru_cache
 import math
 import pytz
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 import plotly.io as pio
+from contextlib import suppress
 from threading import Lock
 import re
+import signal
 import os, sys
+from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
+from collections import defaultdict
+from threading import Lock
+FILE_LOCKS = defaultdict(Lock)
 from concurrent.futures import ThreadPoolExecutor
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -84,8 +92,136 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from datetime import datetime
+from collections import defaultdict
+os.environ["ABSEIL_LOGGING_STDERR_THRESHOLD"] = "3"   # nur Errors
+os.environ["GLOG_minloglevel"] = "3"
+os.environ["NO_AT_BRIDGE"] = "1"  # weniger GTK-Warnungen
+import threading
+_FNG_RT = {"ts": 0, "val": None}
+KEY_GLOBAL = "__global__"
+DRIVERS: dict[str, "WebDriver"] = {}
+DRIVER_LOCKS = defaultdict(threading.Lock)
+import atexit, signal, sys, subprocess
+try:
+    import psutil  # pip install psutil
+except ImportError:
+    psutil = None
+_DRIVERS = []
+_SERVICES = []
+_SERVICE_PIDS = []
+SHUTTING_DOWN = False
+
+def get_driver(*args, headless=True):
+    # args werden ignoriert, nur für Kompatibilität zu get_driver("role", key)
+    if SHUTTING_DOWN:
+        raise RuntimeError("Shutdown in progress")
+
+    # vorhandenen Driver wiederverwenden
+    for d in list(_DRIVERS):
+        try:
+            _ = d.title
+            return d
+        except:
+            pass
+
+    from selenium import webdriver
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    opts = webdriver.ChromeOptions()
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_experimental_option("detach", False)
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-features=OptimizationGuideModelDownloading")
+    # Wichtige Optionen für sauberes Beenden
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--log-level=3")
+    opts.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+    opts.add_experimental_option('useAutomationExtension', False)
+
+    service = Service(ChromeDriverManager().install())
+    drv = webdriver.Chrome(service=service, options=opts)
+
+    _DRIVERS.append(drv)
+    _SERVICES.append(service)
+    try:
+        if getattr(service, "process", None):
+            _SERVICE_PIDS.append(service.process.pid)
+    except:
+        pass
+    return drv
+
+
+######################chrome beenden####################
+
+def signal_handler(sig, frame):
+    """Behandelt System-Signale für ordnungsgemäßes Beenden."""
+    print(f"\n🛑 Signal {sig} empfangen, beende Anwendung...")
+    shutdown_all_drivers()
+    sys.exit(0)
+
+
+
+
+def request_shutdown():
+    # 1) Flag setzen, damit nichts Neues mehr startet
+    global SHUTTING_DOWN
+    SHUTTING_DOWN = True
+
+    # 2) Intervals/Ticker abschalten (siehe Callback unten)
+
+    # 3) Cleanup sofort
+    _cleanup()
+
+def _cleanup():
+    import atexit, sys, subprocess
+    try:
+        for d in list(_DRIVERS):
+            try: d.quit()
+            except: pass
+        for s in list(_SERVICES):
+            try:
+                p = getattr(s, "process", None)
+                if p:
+                    try: p.terminate()
+                    except: pass
+            except: pass
+    finally:
+        # Windows-Fallback: hart killen
+        for im in ("chromedriver.exe", "chrome.exe"):
+            try:
+                subprocess.run(["taskkill", "/F", "/IM", im, "/T"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except: pass
+atexit.register(_cleanup)
+
+def _signal_handler(sig, frame):
+    _cleanup()
+    sys.exit(0)
+
+# Signale registrieren
+def _register_signals():
+    import threading
+    if threading.current_thread() is threading.main_thread():
+        for s in (getattr(signal, "SIGINT", None),
+                  getattr(signal, "SIGTERM", None),
+                  getattr(signal, "SIGBREAK", None)):
+            if s:
+                signal.signal(s, _signal_handler)
+
+atexit.register(_cleanup)
+
+
+
+
+######################Ende chrome beenden#################
+
 
 TZ_BERLIN = pytz.timezone("Europe/Berlin")
+
 
 # für Ampel 2 erweiterung########
 
@@ -110,6 +246,16 @@ def _fred_last(series_id, days=14):
     if not vals: return None
     try: return float(vals[-1])
     except: return None
+
+def find_text_retry(driver, locator: tuple[str, str], wait_s=10, retries=3):
+    for _ in range(retries):
+        try:
+            el = WebDriverWait(driver, wait_s).until(EC.visibility_of_element_located(locator))
+            return el.text
+        except StaleElementReferenceException:
+            continue
+    raise TimeoutException("stale after retries")
+
 
 def get_sofr_proxy_comment(cache_sec=1800):
     """Gibt (bps:int, text:str). Cacht für cache_sec Sekunden."""
@@ -137,82 +283,164 @@ def get_sofr_proxy_comment(cache_sec=1800):
     elif abs(bps) >= 10:
         txt = "Normalbereich (kein Stress): 10–40 bps – Typisch in ruhigen Marktphasen."
     else:
-        txt = "Unter Normalbereich (<10 bps) – sehr ruhige Interbank-Lage."
+        txt = "Unter Normalbereich (<10 bps) – sehr ruhige Interbank-Lage"
 
     _SOFR_CACHE.update({"ts": now, "bps": bps, "text": txt})
     return bps, txt
 ##################################################################################################
+def scrape_onvista_leverage(current_underlying: str) -> list[float]:
+    key = f"onvista_{current_underlying}"
+    lock = DRIVER_LOCKS[key]
+    with lock:
+        drv = get_driver("onvista", current_underlying)
+        url_long = ONVISTA_URLS[current_underlying]["long"]
+        drv.get(url_long)
+
+        WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #page, .content"))
+        )
+
+        with suppress(Exception):
+            table_txt = find_text_retry(drv, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
+            vals = _parse_leverage_numbers(table_txt)
+            if vals:
+                return vals
+
+        drv.get(ONVISTA_URLS[current_underlying]["short"])
+        WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #page, .content"))
+        )
+        table_txt = find_text_retry(drv, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
+        return _parse_leverage_numbers(table_txt)
+
+def switch_underlying(new_underlying: str):
+    # A) laufenden Loop sauber stoppen
+    stop_event.set()
+    if update_thread and update_thread.is_alive():
+        update_thread.join(timeout=5)
+
+    # B) alte Driver schließen
+    reset_drivers_on_underlying_change(old_underlying=selected_underlying)
+
+    # C) globalen Zustand setzen
+    set_selected_underlying(new_underlying)  # deine Setter-Funktion
+
+    # D) Caches leeren
+    with suppress(Exception):
+        scrape_average_leverage.cache_clear()
+    # weitere @lru_cache-Funktionen hier leeren
+
+    # E) neu starten
+    stop_event.clear()
+    start_update_thread()
 
 
-# --- VSTOXX (stock3) robust ---
-_last_vstoxx_change = None
 
-def get_vstoxx_change_stock3(driver, timeout=20, retries=3):
-    """
-    Liefert die Tagesänderung des VSTOXX in Prozent als float (z.B. 0.85).
-    Quelle: stock3 – stabile Detail-URL + klassischer Selektor.
-    Fällt auf den letzten gültigen Wert zurück.
-    """
+def get_vstoxx_change_stock3(driver=None, timeout=25, retries=3):
     global _last_vstoxx_change
     url = "https://stock3.com/indizes/vstoxx-volatilitaetsindex-17271029/"
-    try:
-        driver.get(url)
-    except Exception as e:
-        print(f"⚠️ VSTOXX: Navigation fehlgeschlagen: {e}")
-        return _last_vstoxx_change
 
-    # Cookie-Banner versuchen zu schließen
-    try:
-        accept_cookies_if_present(driver, timeout=8)
-    except Exception:
-        pass
+    if driver is None:
+        driver = get_driver("general", KEY_GLOBAL)
 
     for attempt in range(retries):
         try:
-            el = WebDriverWait(driver, timeout).until(
-                EC.visibility_of_element_located((By.CSS_SELECTOR, "span.instrument-value.changePerc"))
-            )
-            raw = (el.text or el.get_attribute("data-inst-formatted") or "").strip()
-            # "0,85 %" → 0.85
-            txt = (raw.replace('%','')
-                      .replace('\xa0',' ')
-                      .replace(' ','')
-                      .replace('−','-')
-                      .replace('+','')
-                      .replace(',', '.'))
-            val = float(txt)
-            _last_vstoxx_change = round(val, 2)
-            print(f"✔️ VSTOXX Veränderung: {_last_vstoxx_change} % (Quelle: stock3 klassisch)")
-            return _last_vstoxx_change
-        except (StaleElementReferenceException, TimeoutException):
+            driver.get(url + f"?t={int(time.time())}")
             try:
-                driver.refresh()
+                accept_cookies_if_present(driver, timeout=5)
             except Exception:
                 pass
-            continue
-        except Exception as e:
-            print(f"⚠️ VSTOXX: Unerwarteter Fehler: {e} – nutze Last-Good.")
-            break
 
+            WebDriverWait(driver, timeout).until(lambda d: _parse_vstoxx_value(d) is not None)
+            val = _parse_vstoxx_value(driver)
+            if val is not None and val != 0.0:
+                _last_vstoxx_change = round(val, 2)
+                print(f"✔️ VSTOXX Veränderung: {_last_vstoxx_change} % (stock3)")
+                return _last_vstoxx_change
+
+            driver.refresh()
+            time.sleep(2)
+        except (TimeoutException, StaleElementReferenceException, WebDriverException) as e:
+            print(f"⚠️ VSTOXX Versuch {attempt+1}: {e}")
+            time.sleep(3)
+    print(f"⚠️ VSTOXX: Fallback auf letzten Wert: {_last_vstoxx_change}")
     return _last_vstoxx_change
+
+def get_vstoxx_change_onvista():
+    try:
+        d = get_driver("general", KEY_GLOBAL)
+        d.get("https://www.onvista.de/index/VSTOXX-Volatilitaetsindex-Index-12105800")
+        time.sleep(2.5)
+        # Positiv/negativ wird per Klasse markiert; Wert steckt im value-Attribut des <data>-Tags.
+        try:
+            el = d.find_element(By.CSS_SELECTOR, "data.text-positive.whitespace-nowrap.ml-4")
+        except Exception:
+            el = d.find_element(By.CSS_SELECTOR, "data.text-negative.whitespace-nowrap.ml-4")
+        vstoxx_change = el.get_attribute("value")
+        return float(str(vstoxx_change).replace(",", "."))
+    except Exception as e:
+        print(f"⚠️ OnVista VSTOXX Fehler: {e}")
+        return None
+
+
+def _parse_vstoxx_value(driver):
+    """
+    Hilfsfunktion: Liest den Prozentwert aus dem VSTOXX-Element.
+    Gibt einen float oder None zurück.
+    """
+    try:
+        el = driver.find_element(By.CSS_SELECTOR, "span.instrument-value.changePerc")
+        raw = (el.text or el.get_attribute("data-inst-formatted") or "").strip()
+        # Bereinige den String und konvertiere ihn in eine float-Zahl
+        txt = (raw.replace('%', '')
+                  .replace('\xa0', ' ')
+                  .replace(' ', '')
+                  .replace('−', '-')
+                  .replace('+', '')
+                  .replace(',', '.'))
+        return float(txt)
+    except (NoSuchElementException, ValueError, Exception):
+        return None
 
 
 _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
+_APP_SHUTDOWN = False
 
-def get_driver() -> webdriver.Chrome:
-    global _DRIVER
-    with _DRIVER_LOCK:
-        if _DRIVER is not None:
-            try:
-                # Lösche alle Cookies für eine frische Session
-                _DRIVER.delete_all_cookies()
-            except:
-                pass
-        if _DRIVER is None:
-            service = Service(ChromeDriverManager().install())
-            _DRIVER = webdriver.Chrome(service=service, options=_make_chrome_options())
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+def start_driver(headless=True):
+    if _APP_SHUTDOWN:
+        raise RuntimeError("App shutting down; no new drivers")
+
+    global _DRIVER, _SERVICE
+    if _DRIVER:
         return _DRIVER
+
+    opts = webdriver.ChromeOptions()
+    if headless: opts.add_argument("--headless=new")
+    opts.add_experimental_option("detach", False)
+    opts.add_argument("--disable-gpu")
+    opts.add_argument("--log-level=2")
+    # vermeidet „Geister“-Relaunches über OS-Optimierungen
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-renderer-backgrounding")
+
+    service = Service(ChromeDriverManager().install())
+    drv = webdriver.Chrome(service=service, options=opts)
+    drv.set_page_load_timeout(20)
+    drv.set_script_timeout(20)
+
+    _DRIVER = drv
+    _SERVICE = service
+    try:
+        _DRIVERS.append(drv); _SERVICES.append(service)
+        if getattr(service, "process", None):
+            _SERVICE_PIDS.append(service.process.pid)
+    except Exception:
+        pass
+    return drv
 
 
 def set_sound_enabled(val: bool):
@@ -223,6 +451,35 @@ def set_sound_enabled(val: bool):
 def is_sound_enabled() -> bool:
     with _SOUND_LOCK:
         return _SOUND_ENABLED
+        
+
+def atomic_write_csv(df, final_path: str, max_retries: int = 6):
+    """Windows-sicher: Lock + Retry-Replace."""
+    lock = FILE_LOCKS[final_path]
+    with lock:
+        dirpath = os.path.dirname(final_path) or "."
+        basename = os.path.basename(final_path)
+        fd, tmppath = tempfile.mkdtemp(prefix=basename + ".", dir=dirpath), None
+        # wir erzeugen eine temp-Datei im tmp-Ordner und benennen sie dann um
+        try:
+            tmpfile = os.path.join(fd, basename + ".tmp")
+            df.to_csv(tmpfile, index=False, encoding="utf-8", lineterminator="\n")
+            # Replace mit Retry, falls Ziel kurz gelockt ist (Explorer/Leser)
+            for i in range(max_retries):
+                try:
+                    os.replace(tmpfile, final_path)
+                    break
+                except PermissionError:
+                    time.sleep(0.25 * (i + 1))
+            else:
+                raise PermissionError(f"Lock auf {final_path} blieb bestehen.")
+        finally:
+            # tmp-Ordner aufräumen
+            try:
+                if os.path.isdir(fd):
+                    shutil.rmtree(fd, ignore_errors=True)
+            except Exception:
+                pass
         
 def resource_path(rel_path: str) -> str:
     """liefert Pfade korrekt, egal ob im PyInstaller-Binary oder im normalen Python"""
@@ -271,6 +528,12 @@ MARKET_TIMES = {
     "EUROPE": {"start": {"hour": 9, "minute": 0}, "end": {"hour": 17, "minute": 30}},
 }
 
+# direkt UNTER MARKET_TIMES einfügen
+HOLIDAYS_FIXED = {
+    "EUROPE": {(1, 1), (12, 25), (12, 26)},   # Neujahr, 1./2. Weihnachtsfeiertag
+    "USA":    {(1, 1), (7, 4),  (12, 25)},    # New Year, Independence Day, Christmas
+}
+
 def is_market_open(underlying):
     tz = pytz.timezone('Europe/Berlin')
     now = datetime.now(tz)
@@ -278,19 +541,31 @@ def is_market_open(underlying):
     start_time = MARKET_TIMES[market]["start"]
     end_time = MARKET_TIMES[market]["end"]
     start_dt = now.replace(hour=start_time["hour"], minute=start_time["minute"], second=0, microsecond=0)
-    end_dt = now.replace(hour=end_time["hour"], minute=end_time["minute"], second=0, microsecond=0)
+    end_dt   = now.replace(hour=end_time["hour"],   minute=end_time["minute"],   second=0, microsecond=0)
     market_hours = f"{start_time['hour']:02d}:{start_time['minute']:02d}-{end_time['hour']:02d}:{end_time['minute']:02d} Uhr MEZ"
+
+    # Wochenende oder fester Feiertag -> geschlossen
+    if now.weekday() >= 5 or (now.month, now.day) in HOLIDAYS_FIXED.get(market, set()):
+        return f"❌ Börse geschlossen ({market_hours})"
+
     return f"✅ Börse geöffnet ({market_hours})" if start_dt <= now <= end_dt else f"❌ Börse geschlossen ({market_hours})"
 
+
 # ==== WebDriver-Setup ====
-_DRIVER = None
-_DRIVER_LOCK = threading.Lock()
+_DRIVER_POOL = {
+    "onvista": None,  # Driver ausschließlich für OnVista (Hebel-Scraping)
+    "general": None   # Driver für alles andere (VDAX, VSTOXX, Finanztreff, etc.)
+}
+_DRIVER_POOL_LOCK = threading.Lock()
 _TMP_PROFILE_DIR = None
 
 def _make_chrome_options() -> Options:
     global _TMP_PROFILE_DIR
     _TMP_PROFILE_DIR = tempfile.mkdtemp(prefix=f"hebelwatch_profile_{time.time()}_")
     opts = Options()
+    opts.add_argument("--lang=de-DE,de")
+    opts.add_experimental_option("prefs", {"intl.accept_languages": "de,de_DE"})
+    opts.add_experimental_option("prefs", {"intl.accept_languages": "de,de_DE"})
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument(f"--user-data-dir={_TMP_PROFILE_DIR}")
@@ -307,31 +582,19 @@ def _make_chrome_options() -> Options:
 
 
 def accept_cookies_if_present(d, timeout=6):
-    try:
-        # Häufig OneTrust/Consent-Manager
-        WebDriverWait(d, timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
-        # Varianten durchprobieren
-        candidates = [
-            (By.XPATH, "//button[contains(., 'Akzeptieren')]"),
-            (By.XPATH, "//button[contains(., 'Zustimmen')]"),
-            (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
-            (By.XPATH, "//button[contains(@class,'consent') and (contains(.,'OK') or contains(.,'Akzeptieren'))]"),
-        ]
-        for how, sel in candidates:
-            try:
-                btn = d.find_element(how, sel)
-                if btn.is_displayed():
-                    btn.click()
-                    time.sleep(0.8)
-                    break
-            except NoSuchElementException:
-                continue
-    except TimeoutException:
-        pass
-    except WebDriverException:
-        pass
+    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    for how, sel in [
+        (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
+        (By.XPATH, "//button[contains(., 'Akzeptieren') or contains(., 'Zustimmen') or contains(., 'Accept All')]"),
+        (By.XPATH, "//button[contains(@class,'consent') and (contains(.,'OK') or contains(.,'Akzeptieren'))]"),
+    ]:
+        try:
+            btn = d.find_element(how, sel)
+            if btn.is_displayed():
+                btn.click(); time.sleep(0.6); break
+        except Exception:
+            pass
+
 
 
 
@@ -370,7 +633,10 @@ def get_top_news(max_items=9, cache_seconds=60):
     now = time.time()
     if now - _news_cache["ts"] < cache_seconds and _news_cache["items"]:
         return _news_cache["items"]
+   # rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
+   #rss_url = "https://www.tagesschau.de/wirtschaft/finanzen/index~rss2.xml"
     rss_url = "https://www.finanztreff.de/feed/marktberichte.rss"
+    #rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
     try:
         r = requests.get(rss_url, timeout=10)
         r.raise_for_status()
@@ -403,7 +669,9 @@ def get_news_block(page_index=0):
     page_info = f" {page_index + 1}/{num_pages}"
     return html.Div([
         html.Div([
-            html.Span(f"Top-Börsennachrichten (finanztreff.de) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
+        #boerse-frankfurt.de
+        #finanztreff.de
+            html.Span(f"Börsennachrichten (finanztreff.de) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
             html.Span(f"Stand: {last_str}", style={"color": "#555", "fontSize": "90%", "display": "block"})
         ], style={"marginBottom": "10px"}),
         html.Ul([
@@ -440,7 +708,7 @@ def bewerte_rsi_ampel(rsi_value):
     if rsi_value >= 70:
         return "#ff0000", "RSI-Indikator", f"Risiko: Korrektur innerhalb 8 Tage wahrscheinlich! RSI={rsi_value:.1f}%"
     elif rsi_value >= 62:
-        return "#FFA500", "RSI-Indikator", f"Warnung: Markt überhitzt! (RSI {rsi_value:.1f}%) Erhöhtes Crash-Risiko um + 20%"
+        return "#FFA500", "RSI-Indikator", f"Warnung: Markt überhitzt! (RSI {rsi_value:.1f}%) Erhöhtes Rückfall-Risiko"
     else:
         return "#90EE90", "RSI-Indikator", f"RSI unkritisch ({rsi_value:.1f}%)"
 
@@ -486,52 +754,121 @@ UNDERLYINGS = {
 }
 
 selected_underlying = "Dax"
+# Thread-sicherer Zugriff auf das aktuell gewählte Underlying
+_SELECTED_LOCK = Lock()
+
+def get_selected_underlying():
+    with _SELECTED_LOCK:
+        return selected_underlying
+
+def set_selected_underlying(u: str):
+    global selected_underlying
+    with _SELECTED_LOCK:
+        selected_underlying = u
+
 refresh_interval = 7
 last_fetch_time = "-"
 ALARM_THRESHOLD = 999
 stop_event = threading.Event()
 update_thread = None
 
-_last_vdax_change = None
-_last_EURO_STOXX_50_change = None
+#_last_vdax_change = None
+#_last_EURO_STOXX_50_change = None
+# Verwende ein Dictionary:
+_volatility_cache = {
+    "Dax": {"value": None, "ts": 0},
+    "S&P 500": {"value": None, "ts": 0},
+    "EURO STOXX 50": {"value": None, "ts": 0},
+    "Dow Jones": {"value": None, "ts": 0},
+    "Nasdaq": {"value": None, "ts": 0}
+}
 
-def get_vdax_change():
-    global _last_vdax_change
+# Sichtbar konfigurierbar:
+VDAX_WAIT_OVERRIDE = None  # z.B. 4 setzen, sonst dynamisch
+
+def _extract_percent(text: str) -> float | None:
+    m = re.search(r"([+-]?\d+[.,]\d+)\s*%", text)
+    if not m:
+        return None
     try:
-        d = get_driver()
-        d.get("https://www.boerse-frankfurt.de/index/vdax")
-        element = WebDriverWait(d, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "td.widget-table-cell.text-end.change-percent")))
-        raw = element.text.strip()
-        if not raw:
-            return _last_vdax_change
-        value = float(raw.replace("%", "").replace(",", "."))
-        if value == 0.0 and _last_vdax_change not in (None, 0.0):
-            return _last_vdax_change
-        _last_vdax_change = value
-        print(f"✔️ VDAX Veränderung: {value:.2f} %")
-        return value
+        return float(m.group(1).replace(".", "").replace(",", "."))
+    except ValueError:
+        return None
+
+def get_vdax_change(timeout=12):
+    """
+    VDAX %-Änderung von boerse-frankfurt.de robust auslesen.
+    Probiert mehrere Selektoren. Kein None ins Cache schreiben.
+    """
+    url = "https://www.boerse-frankfurt.de/index/vdax"
+    def _try_once():
+        d = get_driver("general")
+        d.get(url + f"?t={int(time.time())}")
+        accept_cookies_if_present(d, timeout=4)
+        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.2)
+
+        # 1) dd nach dt-Label
+        for xp in [
+            "//dt[normalize-space()='Veränderung zum Vortag']/following-sibling::dd[1]",
+            "//td[normalize-space()='Veränderung zum Vortag']/following-sibling::td[1]",
+            "//div[contains(@class,'change') or contains(@class,'percent') or contains(@class,'veraenderung')]",
+            "//*[contains(text(), '%')]"
+        ]:
+            try:
+                el = d.find_element(By.XPATH, xp)
+                raw = el.text.strip()
+                val = _extract_percent(raw)
+                if val is not None:
+                    return round(val, 2)
+            except Exception:
+                continue
+        return None
+
+    try:
+        val = _try_once()
+        if val is None:
+            # Driver neu und zweiter Versuch
+            with _DRIVER_POOL_LOCK:
+                key = f"general_{selected_underlying}"
+                drv = _DRIVER_POOL.get(key)
+                try:
+                    if drv: drv.quit()
+                except Exception:
+                    pass
+                _DRIVER_POOL.pop(key, None)
+            val = _try_once()
     except Exception as e:
-        print("⚠️ Fehler beim Laden der VDAX-Seite:", e)
-        return _last_vdax_change
+        print(f"⚠️ VDAX Frankfurt fehlgeschlagen: {e}")
+        val = None
+
+    if val is None:
+        val = get_vdax_change_finanztreff()
+    if val is None:
+        val = get_vdax_change_yahoo()
+
+    if val is not None:
+        _volatility_cache["Dax"] = {"value": val, "ts": time.time()}
+    return val
+
 
 def get_EURO_STOXX_50_change():
-    global _last_EURO_STOXX_50_change
     try:
-        d = get_driver()
-        d.get("https://www.boerse-frankfurt.de/index/EURO STOXX 50")
-        element = WebDriverWait(d, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "td.widget-table-cell.text-end.change-percent")))
-        raw = element.text.strip()
-        if not raw:
-            return _last_EURO_STOXX_50_change
-        value = float(raw.replace("%", "").replace(",", "."))
-        if value == 0.0 and _last_EURO_STOXX_50_change not in (None, 0.0):
-            return _last_EURO_STOXX_50_change
-        _last_EURO_STOXX_50_change = value
-        print(f"✔️ EURO STOXX 50 Veränderung: {value:.2f} %")
-        return value
+        d = get_driver("general", KEY_GLOBAL)
+        d.get("https://www.boerse-frankfurt.de/index/EURO%20STOXX%2050")
+        el = WebDriverWait(d, 12).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "td.widget-table-cell.text-end.change-percent"))
+        )
+        raw = (el.text or "").strip()
+        val = _parse_german_percent(raw)
+        if val is not None:
+            print(f"✔️ EURO STOXX 50 Veränderung: {val:.2f} %")
+        else:
+            print(f"⚠️ EURO STOXX 50: konnte Zahl nicht parsen (raw='{raw}')")
+        return val
     except Exception as e:
-        print("⚠️ Fehler beim Laden der EURO STOXX 50-Seite:", e)
-        return _last_EURO_STOXX_50_change
+        print(f"⚠️ Fehler beim EURO STOXX 50-Abruf: {e}")
+        return None
 
 def _parse_german_percent(raw: str) -> float | None:
     """Wandelt '0,85 %' / '+1,2%' / '-0,30 %' in float (0.85 / 1.2 / -0.30)."""
@@ -627,41 +964,86 @@ def cleanup_memory():
         _DRIVER.execute_script("window.open('','_blank').close()")
         _DRIVER.execute_script("window.location.reload(true)")
 
+
 def get_volatility_change(underlying):
     """
-    Liefert die prozentuale Tagesänderung des passenden Volatilitätsindex:
-    Fallback-Kette:
-      - EURO STOXX 50: OnVista -> stoxx.com -> Börse Frankfurt
-      - Dax:           Börse Frankfurt -> finanztreff.de
-      - S&P 500:       Yahoo (VIX)
-      - Dow Jones:     Yahoo (VXD)
-      - Nasdaq:        Yahoo (VXN)
+    Liefert die prozentuale Tagesänderung des passenden Volatilitätsindex
+    mit unterlying-spezifischem Caching.
     """
+    global _volatility_cache
+    
+    # Cache-Prüfung (5 Minuten Cache)
+    now = time.time()
+    cache_data = _volatility_cache.get(underlying, {"value": None, "ts": 0})
+    if now - cache_data["ts"] < 10 and cache_data["value"] is not None:
+        return cache_data["value"]
+    
     try:
         if underlying == "EURO STOXX 50":
-            return get_vstoxx_change_stock3(get_driver())                
-           
-
+            val = get_vstoxx_change_onvista()            
         elif underlying == "Dax":
             val = get_vdax_change()
             if val is None:
                 val = get_vdax_change_finanztreff()
-            return val
-
         elif underlying == "S&P 500":
-            return get_vix_change_yahoo()
-
+            val = get_vix_change_yahoo()
         elif underlying == "Dow Jones":
-            return get_vxd_change_yahoo()
-
+            val = get_vxd_change_yahoo()
         elif underlying == "Nasdaq":
-            return get_vxn_change_yahoo()
-
+            val = get_vxn_change_yahoo()
+        else:
+            val = None
+            
+        # Cache aktualisieren
+        _volatility_cache[underlying] = {"value": val, "ts": now}
+        return val
+        
     except Exception as e:
-        print(f"Fehler in get_volatility_change({underlying}): {e}")
+        print(f"...{e}")
+        if now - cache_data.get("ts", 0) < 60:
+            return cache_data.get("value")
+            return None
 
-    return None
+from contextlib import suppress
 
+def reset_drivers_on_underlying_change(old_underlying: str | None = None):
+    keys = list(DRIVERS.keys())
+    if old_underlying is None:
+        kill = [k for k in keys if k.startswith("onvista_")]
+    else:
+        kill = [k for k in keys if k.endswith(f"_{old_underlying}")]
+    for k in kill:
+        drv = DRIVERS.pop(k, None)
+        if drv:
+            with suppress(Exception):
+                drv.quit()
+        with suppress(Exception):
+            DRIVER_LOCKS.pop(k, None)
+
+import re
+def _parse_leverage_numbers(txt: str) -> list[float]:
+    # erfasst z.B. "x24,58" oder "24.58" oder "24,58"
+    nums = re.findall(r"(?:(?:x)?)(\d{1,3}(?:[.,]\d{1,2})?)", txt)
+    out = []
+    for n in nums:
+        n = n.replace(".", "").replace(",", ".")
+        try:
+            out.append(float(n))
+        except ValueError:
+            pass
+    return out
+
+
+def update_loop():
+    while not stop_event.is_set():
+        current_underlying = get_selected_underlying()  # einmal lesen
+        try:
+            levs = scrape_onvista_leverage(current_underlying)
+            # … weiterverarbeiten
+        except Exception as e:
+            log_error(f"onvista scrape failed [{current_underlying}]: {e}")
+        finally:
+            stop_event.wait(2.0)  # Intervall
 
 
 def get_vstoxx_change() -> float | None:
@@ -721,37 +1103,37 @@ def log_index_event(timestamp, index_change):
             writer.writerow(["timestamp", "index_change"])
         writer.writerow([timestamp, index_change])
 
+def _wait_onvista_table(d, timeout=20):
+    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+    try:
+        WebDriverWait(d, 6).until(
+            EC.presence_of_element_located((By.XPATH, "//table//th[contains(., 'Hebel') or contains(., 'Gearing')]"))
+        ); return True
+    except Exception:
+        pass
+    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody")))
+    time.sleep(0.8); return True
+
 @lru_cache(maxsize=8)
 def scrape_average_leverage(url_onvista, url_finanzen=None):
-    """Liest durchschnittliche Hebelwerte ausschließlich von OnVista (kein Finanzen-Fallback)."""
-    print(f"Versuche Daten von OnVista URL abzurufen: {url_onvista}")
-    leverages = []
-    try:
-        d = get_driver()
-        d.get(url_onvista)
-        WebDriverWait(d, 15).until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tr")))
-        WebDriverWait(d, 5).until(lambda drv: "gearingAsk" in drv.page_source or "Hebel" in drv.page_source)
-        soup = BeautifulSoup(d.page_source, "html.parser")
-        for row in soup.find_all("tr"):
-            for cell in row.find_all("td"):
-                text = cell.get_text(strip=True)
-                try:
-                    value = float(text.replace(',', '.'))
-                    if 1 <= value <= 200:
-                        leverages.append(value)
-                        break
-                except ValueError:
-                    continue
-        if leverages:
-            avg = sum(leverages) / len(leverages)
-            print(f"Gefundene Hebelwerte von OnVista: {leverages}")
-            return avg
-    except Exception as e:
-        print(f"Fehler bei OnVista-Abfrage: {e}")
+    key = f"onvista_{get_selected_underlying()}"
+    with DRIVER_LOCKS[key]:
+        d = get_driver("onvista", get_selected_underlying())
+        for attempt in range(2):
+            d.get(url_onvista)
+            accept_cookies_if_present(d, timeout=6)
+            try:
+                _wait_onvista_table(d, timeout=20)
+                txt = find_text_retry(d, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
+                vals = _parse_leverage_numbers(txt or "")
+                if vals: 
+                    print(f"Gefundene Hebelwerte von OnVista: {vals}")
+                    return sum(vals)/len(vals)
+            except TimeoutException:
+                pass
+            d.refresh(); time.sleep(1.0)
+    print("Keine Hebelwerte gefunden (nur OnVista aktiv)."); return None
 
-    print("Keine Hebelwerte gefunden (nur OnVista aktiv).")
-    return None
-    
     
 
 
@@ -854,6 +1236,11 @@ def get_market_hours_comment(underlying):
     market_hours = MARKET_TIMES.get("USA", {"start": {"hour": 15, "minute": 30}, "end": {"hour": 22, "minute": 0}})
     return f"{market_comment} (Öffnungszeiten: {market_hours['start']['hour']:02d}:{market_hours['start']['minute']:02d}-{market_hours['end']['hour']:02d}:{market_hours['end']['minute']:02d} Uhr MEZ)"
 
+
+def _ft_accept_cookies_quick(d, timeout=6):
+    _ft_accept_cookies(d, timeout=timeout)
+
+
 def get_ampel1_status(df, selected_underlying):
     if len(df) < 20 or 'volatility_change' not in df.columns:
         return FARBCODES["gray"], 0.5, "Nicht genug Daten. 50 sec warten."
@@ -901,13 +1288,138 @@ def _ft_accept_cookies(d, timeout=8):
                 pass
     except Exception:
         pass
+###########################USA AMpel 4 Upgradde RSI+Fear##################
+
+########################### USA Ampel 4 Upgrade RSI+Fear ##################
+def bewerte_ampel4_usa(rsi: float, fear: float):
+    """
+    Kombiniert RSI und CNN Fear&Greed für US-Indizes.
+    Gibt Farbe ("green","orange","red","gray") und Kommentar-Text zurück.
+    """
+
+    import math
+
+    # Fallback: neutral, wenn Fear ungültig
+    if fear is None or not math.isfinite(fear):
+        fear = 50  # neutral
+        fear_valid = False
+    else:
+        fear_valid = True
+
+    # Mini-Ampeln
+    rsi_led  = "🟢" if rsi < 62.5 else ("🟠" if rsi < 70 else "🔴")
+    if fear < 25:
+        fear_led = "🔴"  # Extreme Angst
+    elif fear <= 75:
+        fear_led = "⚪"  # Neutral
+    else:
+        fear_led = "🔴"  # Extreme Gier
+
+    if rsi is not None and math.isfinite(rsi) and fear_valid:
+        # Kombinationsmatrix inkl. 62.5–70 Bereich
+        if rsi < 30 and fear < 25:
+            color, note = "green", "Extreme Angst + Überverkauft. Antizyklisch Long begünstigt."
+        elif 30 <= rsi < 62.5 and fear < 25:
+            color, note = "green", "Extreme Angst bei neutralem RSI. Pullback-Long nur mit Trendfilter."
+        elif rsi < 30 and 25 <= fear <= 75:
+            color, note = "green", "Überverkauft. Technischer Rebound möglich."
+        elif 30 <= rsi < 62.5 and fear > 75:
+            color, note = "orange", "Euphorie ohne Überkauft-Bestätigung. Rückschlagrisiko erhöht."
+        elif 62.5 <= rsi < 70 and 25 <= fear <= 75:
+            color, note = "orange", "RSI-Warnung bei neutralem Sentiment. Rückfallrisiko erhöht."
+        elif 62.5 <= rsi < 70 and fear > 75:
+            color, note = "orange", "RSI-Warnung + Gier. Rückschlagrisiko."
+        elif 62.5 <= rsi < 70 and fear < 25:
+            color, note = "gray", "Widerspruch: RSI-Warnung bei Angst. Kein klares Signal."
+        elif rsi >= 70 and 25 <= fear <= 75:
+            color, note = "orange", "Überkauft bei neutralem Sentiment. Gewinnsicherung ratsam."
+        elif rsi >= 70 and fear > 75:
+            color, note = "red", "Überkauft + Extreme Gier. Short-Setup begünstigt."
+        elif rsi < 30 and fear > 75:
+            color, note = "gray", "Widerspruch: Überverkauft bei extremer Gier. Kein Signal."
+        elif rsi >= 70 and fear < 25:
+            color, note = "gray", "Widerspruch: Überkauft bei extremer Angst. Kein Signal."
+        else:
+            color, note = "green", "Neutraler Bereich. Kein klares Signal."
+    else:
+        color, note = "gray", "Keine validen Werte. Ampel neutral."
+
+    # Ausgabe-Kommentar
+    _, _, rsi_text = bewerte_rsi_ampel(rsi)
+    rsi_comment = f"{rsi_led} {rsi_text}"
+    fear_comment = f"{fear_led} Fear={fear:.0f}"
+    line = f"{rsi_comment}<br>{fear_comment} — {note}"
+
+    return color, line
+
+
+import os, csv, datetime as dt, re, requests
+from bs4 import BeautifulSoup
+
+FNG_CSV = "data/fear_greed_us.csv"
+# CNN Fear & Greed JSON-API
+_CNN_FNG_API = "https://production.dataviz.cnn.io/index/fearandgreed/graphdata"
+_CNN_FNG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://edition.cnn.com/markets/fear-and-greed",
+    "Origin": "https://edition.cnn.com",
+    "Connection": "keep-alive",
+}
+
+
+def _read_fng_cache():
+    if not os.path.exists(FNG_CSV): return None
+    rows = {}
+    with open(FNG_CSV, newline="", encoding="utf-8") as f:
+        for d,v in csv.reader(f):
+            rows[d] = int(v)
+    return rows
+
+def _write_fng_cache(rows: dict):
+    os.makedirs(os.path.dirname(FNG_CSV), exist_ok=True)
+    with open(FNG_CSV, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f); [w.writerow([d, rows[d]]) for d in sorted(rows)]
+
+# in fetch_cnn_fng()
+from decimal import Decimal, ROUND_HALF_UP
+
+def fetch_cnn_fng() -> int:
+    r = requests.get(_CNN_FNG_API, headers=_CNN_FNG_HEADERS, timeout=20)
+    r.raise_for_status()
+    js = r.json()
+    fg = js.get("fear_and_greed")
+    score = fg.get("score") if isinstance(fg, dict) else fg
+    # half-up statt Abriss
+    return int(Decimal(str(score)).quantize(0, rounding=ROUND_HALF_UP))
+
+
+
+
+
+def get_fng_today(force_refresh: bool = False, min_refresh_sec: int = 900) -> int:
+    today = dt.date.today().isoformat()
+    now = time.time()
+    rows = _read_fng_cache() or {}
+
+    if not force_refresh and today in rows and now - _FNG_RT["ts"] < min_refresh_sec:
+        return rows[today]
+
+    try:
+        val = fetch_cnn_fng()
+        rows[today] = int(val)
+        _write_fng_cache(rows)
+        _FNG_RT.update({"ts": now, "val": val})
+        return rows[today]
+    except Exception:
+        return rows.get(today, 50)
+
+##################################################
+
 
 def _scrape_finanztreff_header(names):
-    """
-    Liefert dict {Name: %-Change} aus der Header-Tickerleiste.
-    names: Iterable von Label-Strings z.B. ("DAX","S&P 500","NASDAQ 100","Dow 30")
-    """
-    d = get_driver()
+    d = get_driver("general", KEY_GLOBAL)
     d.get("https://www.finanztreff.de/")
     _ft_accept_cookies(d)
     WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "header")))
@@ -925,9 +1437,9 @@ def _scrape_finanztreff_header(names):
             out[name] = float(m_pct.group(1).replace(",", "."))
     return out
 
+
 def _scrape_finanztreff_markets_estoxx50():
-    """Nur EURO STOXX 50 ('E. Stoxx 50') aus der großen Märkte-Tabelle."""
-    d = get_driver()
+    d = get_driver("general", KEY_GLOBAL)
     d.get("https://www.finanztreff.de/")
     _ft_accept_cookies(d)
     WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
@@ -1005,104 +1517,69 @@ def _stoxx_accept_cookies(d, timeout=10):
 
 
 
-def _ft_accept_cookies_quick(d, timeout=8):
-    try:
-        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        for how, sel in [
-            (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
-            (By.XPATH, "//button[contains(., 'Akzeptieren') or contains(., 'Zustimmen')]"),
-        ]:
-            try:
-                btn = d.find_element(how, sel)
-                if btn.is_displayed(): btn.click(); time.sleep(0.4); break
-            except Exception:
-                pass
-    except Exception:
-        pass
-
 def get_vdax_change_finanztreff():
     """
-    Fallback für VDAX aus der großen 'Märkte'-Tabelle auf finanztreff.de
-    Sucht die Zeile mit 'VDAX' und extrahiert den %-Wert in derselben Zeile.
+    Sucht 'VDAX' auf der Startseite und zieht die nächste %-Zahl im selben Block/Text.
+    Null-sicher, ohne .parent-Annäherung.
     """
     try:
-        d = get_driver()
+        d = get_driver("general")
         d.get("https://www.finanztreff.de/")
         _ft_accept_cookies_quick(d)
         WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(1.2)  # dynamische Nachladung
+        time.sleep(1.0)
+        html = d.page_source
+        soup = BeautifulSoup(html, "html.parser")
 
-        soup = BeautifulSoup(d.page_source, "html.parser")
-        target = None
-        for t in soup.find_all(string=re.compile(r"\bVDAX\b", re.I)):
-            node = t.parent
-            for _ in range(5):
-                if node and node.name in ("div", "tr"):
-                    target = node; break
-                node = node.parent
-            if target: break
-        if not target:
-            return None
-
-        row_text = target.get_text(" ", strip=True)
-        m = re.search(r"([+-]?\d+[.,]\d+)\s*%", row_text)
+        # Variante A: zuerst kompaktes Text-Matching
+        text = soup.get_text(" ", strip=True)
+        m = re.search(r"VDAX[^%]{0,120}?([+-]?\d+[.,]\d+)\s*%", text, flags=re.I)
         if m:
             val = float(m.group(1).replace(",", "."))
-            print(f"✔️ VDAX (finanztreff) Veränderung: {val:.2f} %")
+            print(f"✔️ VDAX (finanztreff/Text): {val:.2f} %")
             return val
+
+        # Variante B: gezielte Suche in Elementen, ohne .parent-Ketten
+        for node in soup.find_all(string=re.compile(r"\bVDAX\b", re.I)):
+            block = node
+            # suche im selben Container-Text eine Prozentzahl
+            container = block.parent
+            for _ in range(4):
+                if not container: break
+                txt = container.get_text(" ", strip=True)
+                m2 = re.search(r"([+-]?\d+[.,]\d+)\s*%", txt)
+                if m2:
+                    val = float(m2.group(1).replace(",", "."))
+                    print(f"✔️ VDAX (finanztreff/Block): {val:.2f} %")
+                    return val
+                container = container.parent
     except Exception as e:
         print(f"⚠️ VDAX finanztreff Fallback fehlgeschlagen: {e}")
     return None
 
-import html as _html
 
-_last_vstoxx_change_cache = None  # globaler Puffer
-
-def get_vstoxx_change_stoxx_requests(timeout=10):
-    """
-    VSTOXX von stoxx.com (ohne Selenium).
-    Sucht mehrere Muster, inkl. data-daily-change-percent und Text-Fallbacks.
-    """
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "de-DE,de;q=0.9,en-US;q=0.8,en;q=0.7",
-            "Cache-Control": "no-cache",
-        }
-        r = requests.get("https://www.stoxx.com/index/v2tx/", headers=headers, timeout=timeout)
-        r.raise_for_status()
-        html = r.text
-
-        # 1) präzise: <span class="data-daily-change-percent">(+0.77%)</span>
-        m = re.search(r'data-daily-change-percent[^>]*>\s*\(([^()%]+)%\)\s*<', html, re.I)
-        if m:
-            val = float(m.group(1).replace(",", ".").replace("+", "").strip())
-            print(f"✔️ VSTOXX (stoxx.com) %: {val:.2f}")
-            return val
-
-        # 2) alternative Container-Klassen, z.B. data-current-price-status block
-        m = re.search(r'(?:data-current-price-status|data-daily-change-row)[\s\S]{0,500}?\(([^()%]+)%\)', html, re.I)
-        if m:
-            val = float(m.group(1).replace(",", ".").replace("+", "").strip())
-            print(f"✔️ VSTOXX (stoxx.com/alt) %: {val:.2f}")
-            return val
-
-        # 3) Text-Fallback: komplette Seite ent-HTMLen und im Umfeld von "Change"/"Last Value" suchen
-        text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
-        text = _html.unescape(text)
-        m = re.search(r"(?:Change|Last Value)[^()]{0,150}\(([+-]?\d+[.,]\d+)\s*%\)", text, re.I)
-        if m:
-            val = float(m.group(1).replace(",", "."))
-            print(f"✔️ VSTOXX (stoxx.com/Text) %: {val:.2f}")
-            return val
-
-        print("ℹ️ stoxx.com gefunden, aber kein %-Muster erkannt.")
-    except Exception as e:
-        print(f"⚠️ VSTOXX stoxx.com (requests) fehlgeschlagen: {e}")
+def get_vdax_change_yahoo():
+    """Versucht ^VDAX, danach ^VDAXI. Liefert %-Tagesänderung."""
+    for ticker in ("^VDAX", "^VDAXI"):
+        try:
+            data = yf.Ticker(ticker).history(period="2d")
+            if len(data) >= 2:
+                prev = data["Close"].iloc[-2]
+                curr = data["Close"].iloc[-1]
+                return round((curr - prev) / prev * 100, 2)
+        except Exception:
+            continue
     return None
 
-
+def _safe_spread_pct(long_avg, short_avg):
+    if long_avg is None or short_avg is None:
+        return None
+    if long_avg == 0.0:
+        return None
+    try:
+        return (short_avg / long_avg - 1.0) * 100.0
+    except Exception:
+        return None
 
 def update_data():
     global last_fetch_time, refresh_interval, selected_underlying
@@ -1128,7 +1605,7 @@ def update_data():
             csv_file = get_csv_filename(current_underlying)
             new_data = pd.DataFrame([[
                 datetime.now(TZ_BERLIN), long_avg, short_avg, index_change,
-                (short_avg/long_avg-1)*100 if (long_avg + short_avg) > 0 else None,
+                _safe_spread_pct(long_avg, short_avg),
                 vola_change
             ]], columns=["timestamp","long_avg","short_avg","index_change","short_vs_long_diff_prozent","volatility_change"])
             if os.path.exists(csv_file):
@@ -1137,7 +1614,7 @@ def update_data():
                 df = pd.concat([df, new_data], ignore_index=True)
             else:
                 df = new_data
-            df.to_csv(csv_file, index=False, encoding='utf-8', lineterminator='\n')
+            atomic_write_csv(df, csv_file)
             last_fetch_time = datetime.now(TZ_BERLIN).strftime("%H:%M:%S")
         time.sleep(refresh_interval)
 
@@ -1164,6 +1641,7 @@ def get_vol_label(selected_underlying):
 # Layout
 # -----------------------------------------------
 app.layout = html.Div([
+    dcc.Store(id="app_state", data={"shutdown": False}),
     html.Div([
         html.H1("Leverage Lens", id="exit-title", style={
             "fontSize": "56px", "fontWeight": "bold", "textAlign": "center",
@@ -1171,19 +1649,25 @@ app.layout = html.Div([
             "WebkitBackgroundClip": "text", "WebkitTextFillColor": "transparent",
             "cursor": "pointer", "display": "inline-block", "marginRight": "10px"
         }),
-        html.Span("v60", style={
+        html.Span("v64", style={
             "fontSize": "16px",
             "color": "#666",
             "verticalAlign": "super",
             "fontWeight": "normal"
-        })
+        }),
+         dcc.ConfirmDialog(
+                             id='confirm-exit',
+                             message='Programm wirklich beenden?',
+         ),
+
+
     ], style={"textAlign": "center", "marginBottom": "20px"}),
 
     html.Div(
         dcc.Dropdown(
             id='underlying-dropdown',
-            options=[{'label': 'Dax', 'value': 'Dax'}],
-            value='Dax',
+            options=[{'label': k, 'value': k} for k in UNDERLYINGS.keys()],
+            value=selected_underlying,
             style={"width": "300px","fontWeight": "bold","fontSize": "22px"}
         ),
         style={"display": "flex","justifyContent": "center","margin": "19px 0"}
@@ -1238,6 +1722,27 @@ app.layout = html.Div([
     html.Audio(id="alarm-audio", src="", autoPlay=True, controls=False, style={"display": "none"})
 ])  # Closing the main html.Div
 
+
+
+
+@app.callback(
+    Output("app_state", "data"),
+    Input("btn-exit", "n_clicks"),  # oder Klick auf Logo
+    prevent_initial_call=True
+)
+def on_exit(_):
+    request_shutdown()
+    return {"shutdown": True}
+
+@app.callback(
+    Output("main-interval", "disabled"),
+    Input("app_state", "data"),
+    prevent_initial_call=True
+)
+def stop_intervals(state):
+    return bool(state and state.get("shutdown"))
+
+
 # ---- Sound-Status Callback (einzig) ----
 @app.callback(
     Output("sound-toggle", "options"),
@@ -1276,6 +1781,12 @@ def update_volatility_label(selected_underlying):
 def update_graph(n, selected, volatility_toggle, sound_value):
     global selected_underlying, last_fetch_time, show_volatility, _last_alarm_state
 
+
+    if selected != selected_underlying:
+        selected_underlying = selected
+        reset_drivers_on_underlying_change()  # ← NEU: Driver zurücksetzen    
+        scrape_average_leverage.cache_clear()
+        start_update_thread()
     # Sound-Schalter übernehmen
     sound_on = bool(sound_value) and ("on" in sound_value)
     set_sound_enabled(sound_on)
@@ -1283,11 +1794,6 @@ def update_graph(n, selected, volatility_toggle, sound_value):
 
     # Volatilitäts-Schalter übernehmen
     show_volatility = (volatility_toggle == 'on')
-
-    # Bei Wechsel des Underlyings: Thread neu starten
-    if selected != selected_underlying:
-        selected_underlying = selected
-        start_update_thread()
 
     # Index-Anzeige vorbereiten
     index_display_percentage = "N/A"
@@ -1304,6 +1810,14 @@ def update_graph(n, selected, volatility_toggle, sound_value):
 
     # Haupt-CSV laden
     csv_file = get_csv_filename(selected_underlying)
+    lock = FILE_LOCKS[csv_file]
+    with lock:
+        if os.path.exists(csv_file):
+                df = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
+        else:
+                df = pd.DataFrame(columns=["timestamp","long_avg","short_avg","index_change","volatility_change"])
+
+
     try:
         if os.path.exists(csv_file):
             df = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
@@ -1314,7 +1828,8 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             if 'volatility_change' in df.columns:
                 df['volatility_change'] = df['volatility_change'].ffill().bfill()
         else:
-            df = pd.DataFrame(columns=["timestamp", "long_avg", "short_avg", "index_change"])
+            empty = pd.DataFrame(columns=["timestamp", "long_avg", "short_avg", "index_change"])
+            atomic_write_csv(empty, csv_file)   # statt: file
     except Exception as e:
         print(f"Fehler beim Lesen der CSV: {e}")
         df = pd.DataFrame()
@@ -1377,6 +1892,11 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             
 # --- SOFR-Proxy-Werte holen -      
       
+        sofr_bps = 0
+        sofr_text = "SOFR-Proxy: keine Daten."
+        sofr_mini_color = FARBCODES["gray"]
+        sofr_mini_emoji = "⚪"
+        
         sofr_bps, _ = get_sofr_proxy_comment()  
         
         if sofr_bps is None:
@@ -1437,16 +1957,51 @@ def update_graph(n, selected, volatility_toggle, sound_value):
         ampel3_signal = "System initialisiert"; hebel_signal = "Warte auf Daten"; datenpunkt_info = "Initialisierung läuft"
         tagesverlauf = "-"; ampel3_color = FARBCODES["gray"]; ampel1_color = FARBCODES["gray"]; ampel2_color = FARBCODES["gray"]; ampel1_text_local = ampel1_text
 
-    # RSI / Ampel 4
+    # RSI / Ampel 4 / USA
+# --- Ampel 4: RSI + (für USA) Fear & Greed ---
     rsi_ticker = get_rsi_for_underlying(selected)
-    if rsi_ticker:
-        rsi_value = get_rsi(rsi_ticker)
+    rsi_value  = get_rsi(rsi_ticker) if rsi_ticker else None
+
+    if selected in ("S&P 500", "Dow Jones", "Nasdaq"):
+        fear = get_fng_today(force_refresh=True)  # Cache: heute; sonst live; Datei data/fear_greed_us.csv
+        color, line = bewerte_ampel4_usa(
+            float(rsi_value) if rsi_value is not None else float("nan"),
+            float(fear) if fear is not None else float("nan")
+        )
+        ampel4_color = FARBCODES[color]            # "green/orange/red/gray" → Hex
+        ampel4_title = "Ampel 4: RSI (8) + Fear & Greed"
+        ampel4_text  = line
     else:
-        rsi_value = None
-    if rsi_value is not None:
-        rsi_status, rsi_title, rsi_kommentar = bewerte_rsi_ampel(rsi_value)
-    else:
-        rsi_status, rsi_title, rsi_kommentar = FARBCODES["gray"], "RSI nicht verfügbar", "Keine ausreichenden Daten für RSI"
+    # DAX/EURO STOXX wie bisher nur RSI
+        rsi_status, rsi_title, rsi_text = bewerte_rsi_ampel(rsi_value)
+        # Miniampel-Emoji für RSI (nur Non-US)
+        if rsi_value is None:
+            rsi_emoji = "⚪"
+        elif rsi_value >= 70:
+            rsi_emoji = "🔴"
+        elif rsi_value >= 62:
+            rsi_emoji = "🟠"
+        else:
+            rsi_emoji = "🟢"
+
+
+        ampel4_color = rsi_status
+        ampel4_title = f"Ampel 4: {rsi_title} (8 Tage)"
+        ampel4_text  = f"{rsi_emoji} {rsi_text}"
+        ampel4_lines = ampel4_text.split("<br>")
+        html.Div([
+            html.Span("Kommentar: "),
+            html.Span(ampel4_lines[0]),
+            html.Br(),
+    # zweite Zeile ~10 Zeichen einrücken
+            html.Span(
+                ampel4_lines[1] if len(ampel4_lines) > 1 else "",
+                style={"display": "inline-block", "marginLeft": "10ch"}  # ← Einzug
+            )
+        ], style={"marginLeft":"40px","fontSize":"90%","color":"#333"})
+
+          
+       
 
     kommentar = hebel_signal
     num_pages = max(1, math.ceil(NEWS_TOTAL_ITEMS / NEWS_PAGE_SIZE))
@@ -1499,11 +2054,15 @@ def update_graph(n, selected, volatility_toggle, sound_value):
                 ])
             ], style={"display": "flex","alignItems": "flex-start","marginBottom": "20px"}),
             html.Div([
-                html.Div(style={"width": "35px","height": "35px","borderRadius": "50%","backgroundColor": rsi_status,"display": "inline-block","marginRight": "15px","marginTop": "4px","boxShadow": "0 0 8px 2px rgba(255, 255, 255, 0.5)","border": "2px solid #666","boxSizing": "border-box"}),
+                html.Div(style={"width": "35px","height": "35px","borderRadius": "50%","backgroundColor": ampel4_color,"display": "inline-block","marginRight": "15px","marginTop": "4px","boxShadow": "0 0 8px 2px rgba(255, 255, 255, 0.5)","border": "2px solid #666","boxSizing": "border-box"}),
                 html.Div([
-                    html.Div(f"Ampel 4: {rsi_title} (8 Tage)", style={"fontSize": "100%","fontWeight": "bold"}),
-                    html.Div("Erkennt: Überkaufte (RSI ≥70 %) oder überverkaufte (RSI ≤30 %) Märkte", style={"marginLeft": "20px","fontSize": "90%","color": "#333"}),
-                    html.Div(f"Kommentar: {rsi_kommentar}", style={"marginLeft": "40px","fontSize": "90%","color": "#333"}),
+                    html.Div(f"{ampel4_title}", style={"fontSize": "100%","fontWeight": "bold"}),
+                    html.Div("Erkennt: RSI-Überkauft/-verkauft; in USA zusätzlich CNN Fear & Greed", style={"marginLeft": "20px","fontSize": "90%","color": "#333"}),
+                    html.Div([
+                        html.Span("Kommentar: ", style={"display": "block"}),
+                        html.Span(ampel4_text.replace('<br>', '\n'), 
+                                 style={"display": "block", "marginLeft": "20px", "fontSize": "90%", "color": "#333", "whiteSpace": "pre-line"})
+                    ], style={"marginLeft": "40px"})
                 ])
             ], style={"display": "flex","alignItems": "flex-start","marginBottom": "20px"}),
         ]),
@@ -1533,48 +2092,162 @@ def reset_csv_files(n_clicks):
         file = get_csv_filename(u)
         if os.path.exists(file):
             os.remove(file)
-        pd.DataFrame(columns=["timestamp", "long_avg", "short_avg", "index_change"]).to_csv(file, index=False, encoding='utf-8', lineterminator='\n')
+        empty = pd.DataFrame(columns=["timestamp","long_avg","short_avg","index_change"])
+        atomic_write_csv(empty, file)
+    # Logs optional lassen wie sie sind
     for fname in ["log_ampel.csv", "log_index.csv"]:
         path = os.path.join(CSV_FOLDER, fname)
         if os.path.exists(path):
             os.remove(path)
     return 0
 
+
+
 def cleanup():
-    global _DRIVER, _TMP_PROFILE_DIR
-    if _DRIVER is not None:
-        try:
-            _DRIVER.quit()
-        except:
-            pass
-        _DRIVER = None
+    global _DRIVER_POOL, _TMP_PROFILE_DIR
+    # Beende beide Driver im Pool
+    for use_case, driver in _DRIVER_POOL.items():
+        if driver is not None:
+            try:
+                driver.quit()
+                print(f"✅ Driver für '{use_case}' geschlossen.")
+            except Exception as e:
+                print(f"⚠️ Fehler beim Schließen des Drivers für '{use_case}': {e}")
+            _DRIVER_POOL[use_case] = None
+
+    # Alte Temp-Verzeichnis Bereinigung (falls vorhanden)
     if _TMP_PROFILE_DIR and os.path.exists(_TMP_PROFILE_DIR):
         try:
             shutil.rmtree(_TMP_PROFILE_DIR)
         except:
             pass
 
-atexit.register(cleanup)
-
 import webbrowser, threading
 
+# Erst beim Klick den Dialog öffnen
 @app.callback(
-    Output("exit-title", "children"),
+    Output("confirm-exit", "displayed"),
     Input("exit-title", "n_clicks"),
     prevent_initial_call=True
 )
-def close_app(n_clicks):
-    os._exit(0)   # beendet das Programm sofort
+def show_confirm(n_clicks):
+    return True  # Dialog anzeigen
+
+
+# Reagiere auf Bestätigung
+@app.callback(
+    Output("exit-title", "children"),  # Dummy Output
+    Input("confirm-exit", "submit_n_clicks"),
+    prevent_initial_call=True
+)
+def close_app(n_clicks_submit):
+    if n_clicks_submit:
+        os._exit(0)
+    return "Leverage Lens"  # unverändert
+
+import atexit
+from contextlib import suppress
+
+def shutdown_all_drivers():
+    """Beendet alle noch laufenden WebDriver-Instanzen und Chrome-Prozesse."""
+    global DRIVERS, _DRIVER_POOL, _DRIVERS, _SERVICES, _SERVICE_PIDS
+    
+    # Beende alle Driver im DRIVERS-Dictionary
+    for key, drv in list(DRIVERS.items()):
+        try:
+            drv.quit()
+            print(f"✅ Driver '{key}' geschlossen.")
+        except Exception as e:
+            print(f"⚠️ Fehler beim Schließen des Drivers '{key}': {e}")
+        finally:
+            DRIVERS.pop(key, None)
+    
+    # Beende alle Driver im _DRIVER_POOL
+    for use_case, driver in list(_DRIVER_POOL.items()):
+        if driver is not None:
+            try:
+                driver.quit()
+                print(f"✅ Driver für '{use_case}' geschlossen.")
+            except Exception as e:
+                print(f"⚠️ Fehler beim Schließen des Drivers für '{use_case}': {e}")
+            finally:
+                _DRIVER_POOL[use_case] = None
+    
+    # Beende alle globalen Driver
+    for drv in list(_DRIVERS):
+        try:
+            drv.quit()
+        except Exception:
+            pass
+        finally:
+            if drv in _DRIVERS:
+                _DRIVERS.remove(drv)
+    
+    # Beende Services
+    for service in list(_SERVICES):
+        try:
+            service.stop()
+        except Exception:
+            pass
+        finally:
+            if service in _SERVICES:
+                _SERVICES.remove(service)
+    
+    # Beende Prozesse anhand ihrer PIDs
+    for pid in list(_SERVICE_PIDS):
+        try:
+            if psutil:
+                proc = psutil.Process(pid)
+                proc.terminate()
+                proc.wait(timeout=5)
+        except Exception:
+            pass
+        finally:
+            if pid in _SERVICE_PIDS:
+                _SERVICE_PIDS.remove(pid)
+    
+    # Windows-Fallback: Chrome-Prozesse hart beenden
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(["taskkill", "/F", "/IM", "chromedriver.exe", "/T"], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run(["taskkill", "/F", "/IM", "chrome.exe", "/T"], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except Exception:
+            pass
+    
+    # Temporäre Profile bereinigen
+    global _TMP_PROFILE_DIR
+    if _TMP_PROFILE_DIR and os.path.exists(_TMP_PROFILE_DIR):
+        try:
+            shutil.rmtree(_TMP_PROFILE_DIR, ignore_errors=True)
+        except Exception:
+            pass
+        _TMP_PROFILE_DIR = None
+    
+    print("✅ Alle Chrome-Prozesse bereinigt.")
+
+atexit.register(shutdown_all_drivers)
+
+
 
 
 if __name__ == "__main__":
-    start_update_thread()
-    threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
     try:
+        start_update_thread()
+        threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+        
+        # App starten
         app.run(debug=False, host="127.0.0.1", port=8050, use_reloader=False)
+        
     except OSError as e:
         if "Address already in use" in str(e):
             print(f"Port 8050 is already in use. Trying port 8051...")
             app.run(debug=False, host="127.0.0.1", port=8051, use_reloader=False)
         else:
             raise e
+    except Exception as e:
+        print(f"Unerwarteter Fehler: {e}")
+    finally:
+        # Sicherstellen, dass alle Ressourcen bereinigt werden
+        shutdown_all_drivers()
