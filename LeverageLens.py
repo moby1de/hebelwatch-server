@@ -1,4 +1,4 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v64
+# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v65
 # SOFR +Öffnungszeit update #
 # Kontrolle bei Programmstart - notwendige Module
 
@@ -288,36 +288,31 @@ def get_sofr_proxy_comment(cache_sec=1800):
     _SOFR_CACHE.update({"ts": now, "bps": bps, "text": txt})
     return bps, txt
 ##################################################################################################
+from concurrent.futures import ThreadPoolExecutor
+
 def scrape_onvista_leverage(current_underlying: str) -> list[float]:
-    key = f"onvista_{current_underlying}"
-    lock = DRIVER_LOCKS[key]
-    with lock:
-        drv = get_driver("onvista", current_underlying)
-        url_long = ONVISTA_URLS[current_underlying]["long"]
-        drv.get(url_long)
+    urls = UNDERLYINGS[current_underlying]
+    def scrape(url):
+        try:
+            d = get_driver("onvista", KEY_GLOBAL)
+            d.get(url + f"?t={int(time.time())}")
+            WebDriverWait(d, 3).until(lambda d: "x" in d.find_element(By.CSS_SELECTOR, "table tbody").text)
+            txt = d.find_element(By.CSS_SELECTOR, "table tbody").text
+            vals = _parse_leverage_numbers(txt)
+            return sum(vals)/len(vals) if vals else 15.0
+        except Exception:
+            return 15.0
 
-        WebDriverWait(drv, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #page, .content"))
-        )
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        res = list(ex.map(scrape, [urls["long"], urls["short"]]))
+    return res if len(res)==2 else [15.0,15.0]
 
-        with suppress(Exception):
-            table_txt = find_text_retry(drv, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
-            vals = _parse_leverage_numbers(table_txt)
-            if vals:
-                return vals
-
-        drv.get(ONVISTA_URLS[current_underlying]["short"])
-        WebDriverWait(drv, 10).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #page, .content"))
-        )
-        table_txt = find_text_retry(drv, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
-        return _parse_leverage_numbers(table_txt)
 
 def switch_underlying(new_underlying: str):
     # A) laufenden Loop sauber stoppen
     stop_event.set()
     if update_thread and update_thread.is_alive():
-        update_thread.join(timeout=5)
+        update_thread.join(timeout=1)
 
     # B) alte Driver schließen
     reset_drivers_on_underlying_change(old_underlying=selected_underlying)
@@ -336,7 +331,7 @@ def switch_underlying(new_underlying: str):
 
 
 
-def get_vstoxx_change_stock3(driver=None, timeout=25, retries=3):
+def get_vstoxx_change_stock3(driver=None, timeout=3, retries=3):
     global _last_vstoxx_change
     url = "https://stock3.com/indizes/vstoxx-volatilitaetsindex-17271029/"
 
@@ -359,7 +354,10 @@ def get_vstoxx_change_stock3(driver=None, timeout=25, retries=3):
                 return _last_vstoxx_change
 
             driver.refresh()
-            time.sleep(2)
+            WebDriverWait(driver, 1).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "span.instrument-value.changePerc"))
+)
+
         except (TimeoutException, StaleElementReferenceException, WebDriverException) as e:
             print(f"⚠️ VSTOXX Versuch {attempt+1}: {e}")
             time.sleep(3)
@@ -370,7 +368,7 @@ def get_vstoxx_change_onvista():
     try:
         d = get_driver("general", KEY_GLOBAL)
         d.get("https://www.onvista.de/index/VSTOXX-Volatilitaetsindex-Index-12105800")
-        time.sleep(2.5)
+        WebDriverWait(d, 0.5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         # Positiv/negativ wird per Klasse markiert; Wert steckt im value-Attribut des <data>-Tags.
         try:
             el = d.find_element(By.CSS_SELECTOR, "data.text-positive.whitespace-nowrap.ml-4")
@@ -581,8 +579,10 @@ def _make_chrome_options() -> Options:
     return opts
 
 
-def accept_cookies_if_present(d, timeout=6):
-    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+def accept_cookies_if_present(d, timeout=4):
+    WebDriverWait(d, timeout).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
     for how, sel in [
         (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
         (By.XPATH, "//button[contains(., 'Akzeptieren') or contains(., 'Zustimmen') or contains(., 'Accept All')]"),
@@ -591,9 +591,13 @@ def accept_cookies_if_present(d, timeout=6):
         try:
             btn = d.find_element(how, sel)
             if btn.is_displayed():
-                btn.click(); time.sleep(0.6); break
+                btn.click()
+                # Statt Sleep warten bis der Button verschwindet
+                WebDriverWait(d, 2).until(EC.staleness_of(btn))
+                break
         except Exception:
             pass
+
 
 
 
@@ -633,9 +637,9 @@ def get_top_news(max_items=9, cache_seconds=60):
     now = time.time()
     if now - _news_cache["ts"] < cache_seconds and _news_cache["items"]:
         return _news_cache["items"]
-   # rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
+    rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
    #rss_url = "https://www.tagesschau.de/wirtschaft/finanzen/index~rss2.xml"
-    rss_url = "https://www.finanztreff.de/feed/marktberichte.rss"
+    #rss_url = "https://www.finanztreff.de/feed/marktberichte.rss"
     #rss_url = "https://api.boerse-frankfurt.de/v1/feeds/news.rss"
     try:
         r = requests.get(rss_url, timeout=10)
@@ -669,9 +673,7 @@ def get_news_block(page_index=0):
     page_info = f" {page_index + 1}/{num_pages}"
     return html.Div([
         html.Div([
-        #boerse-frankfurt.de
-        #finanztreff.de
-            html.Span(f"Börsennachrichten (finanztreff.de) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
+            html.Span(f"Börsennachrichten (boerse-frankfurt.de) Seite {page_info}", style={"fontWeight": "bold", "display": "block"}),
             html.Span(f"Stand: {last_str}", style={"color": "#555", "fontSize": "90%", "display": "block"})
         ], style={"marginBottom": "10px"}),
         html.Ul([
@@ -795,61 +797,58 @@ def _extract_percent(text: str) -> float | None:
     except ValueError:
         return None
 
-def get_vdax_change(timeout=12):
-    """
-    VDAX %-Änderung von boerse-frankfurt.de robust auslesen.
-    Probiert mehrere Selektoren. Kein None ins Cache schreiben.
-    """
-    url = "https://www.boerse-frankfurt.de/index/vdax"
-    def _try_once():
-        d = get_driver("general")
-        d.get(url + f"?t={int(time.time())}")
-        accept_cookies_if_present(d, timeout=4)
-        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(1.2)
-
-        # 1) dd nach dt-Label
-        for xp in [
-            "//dt[normalize-space()='Veränderung zum Vortag']/following-sibling::dd[1]",
-            "//td[normalize-space()='Veränderung zum Vortag']/following-sibling::td[1]",
-            "//div[contains(@class,'change') or contains(@class,'percent') or contains(@class,'veraenderung')]",
-            "//*[contains(text(), '%')]"
-        ]:
-            try:
-                el = d.find_element(By.XPATH, xp)
-                raw = el.text.strip()
-                val = _extract_percent(raw)
-                if val is not None:
-                    return round(val, 2)
-            except Exception:
-                continue
-        return None
-
+def get_vdax_change(timeout=6):
+    """VDAX %-Änderung: Frankfurt -> Finanztreff -> (optional) Yahoo. Kein 0.0-Fallback."""
+    val = None
+    # 1) Börse Frankfurt: explizit die %-Zelle
     try:
-        val = _try_once()
-        if val is None:
-            # Driver neu und zweiter Versuch
-            with _DRIVER_POOL_LOCK:
-                key = f"general_{selected_underlying}"
-                drv = _DRIVER_POOL.get(key)
-                try:
-                    if drv: drv.quit()
-                except Exception:
-                    pass
-                _DRIVER_POOL.pop(key, None)
-            val = _try_once()
+        d = get_driver("general")
+        d.get("https://www.boerse-frankfurt.de/index/vdax?t=%d" % int(time.time()))
+        accept_cookies_if_present(d, timeout=4)
+        el = WebDriverWait(d, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "td.widget-table-cell.text-end.change-percent"))
+        )
+        raw = (el.text or "").strip()
+        val = _parse_german_percent(raw)
+        if val is not None:
+            print(f"✔️ VDAX (Frankfurt): {val:.2f} %")
     except Exception as e:
-        print(f"⚠️ VDAX Frankfurt fehlgeschlagen: {e}")
+        pass
+
+    # 2) Finanztreff Backup
+    if val is None:
+        try:
+            val = get_vdax_change_finanztreff()
+            if val is not None:
+                print(f"✔️ VDAX (finanztreff): {val:.2f} %")
+        except Exception:
+            val = None
+
+    # 3) Optional: Yahoo als dritter Versuch (kannst du auch komplett entfernen)
+    if val is None:
+        yv = get_vdax_change_yahoo()  # siehe unten
+        if yv is not None:
+            print(f"✔️ VDAX (Yahoo): {yv:.2f} %")
+        val = yv
+
+    # Plausi: Punktwerte/Fehltreffer verwerfen
+    if val is not None and abs(val) < 0.5:
         val = None
 
-    if val is None:
-        val = get_vdax_change_finanztreff()
-    if val is None:
-        val = get_vdax_change_yahoo()
-
+    # Auf Erfolg: Cache setzen (nur für Fehler-Fallback)
     if val is not None:
         _volatility_cache["Dax"] = {"value": val, "ts": time.time()}
-    return val
+        return val
+
+    # Fehler: letzte gute Zahl nur als Notnagel (max. 120 s alt)
+    last = _volatility_cache.get("Dax", {})
+    if last and (time.time() - last.get("ts", 0) < 120) and last.get("value") is not None:
+        print("⚠️ VDAX live fehlgeschlagen → benutze letzten gültigen Wert")
+        return last["value"]
+
+    return None
+
+
 
 
 def get_EURO_STOXX_50_change():
@@ -1021,17 +1020,72 @@ def reset_drivers_on_underlying_change(old_underlying: str | None = None):
             DRIVER_LOCKS.pop(k, None)
 
 import re
+import statistics
+from collections import Counter
+
+def trimmed_mean(values, trim=0.1):
+    if not values:
+        return None
+    vs = sorted(values)
+    k = int(len(vs) * trim)
+    vs = vs[k: len(vs)-k] if len(vs) - 2*k > 0 else vs
+    return round(sum(vs) / len(vs), 2)
+
 def _parse_leverage_numbers(txt: str) -> list[float]:
-    # erfasst z.B. "x24,58" oder "24.58" oder "24,58"
-    nums = re.findall(r"(?:(?:x)?)(\d{1,3}(?:[.,]\d{1,2})?)", txt)
-    out = []
-    for n in nums:
-        n = n.replace(".", "").replace(",", ".")
+    """
+    Extrahiert plausible Hebel aus Tabellen-Text.
+    Filter:
+      - erlaubt 0.5 <= x <= 150
+      - entfernt Duplikate (auf 2 Dez. gerundet)
+      - verwirft Werte-„Kämme“ (wenn 1–2 Werte >80% der Treffer ausmachen)
+      - gibt am Ende eine Liste gefilterter Hebel zurück
+    """
+    # 1) Rohzahlen holen (x24,5 | 24.5 | 24,5)
+    raw = re.findall(r"(?:x)?(\d{1,3}(?:[.,]\d{1,2})?)", txt, flags=re.IGNORECASE)
+    vals = []
+    for n in raw:
         try:
-            out.append(float(n))
+            v = float(n.replace(".", "").replace(",", "."))
+            if 0.5 <= v <= 150:
+                vals.append(v)
         except ValueError:
-            pass
-    return out
+            continue
+
+    if not vals:
+        return []
+
+    # 2) Duplikate/Mehrfachlistings zusammenfassen (Onvista zeigt identische Scheine oft mehrfach)
+    dedup = {}
+    for v in vals:
+        key = round(v, 2)
+        dedup.setdefault(key, 0)
+        dedup[key] += 1
+
+    # 3) „Kamm“-Filter: Wenn 1–2 Werte >80% aller Treffer stellen, behalten wir nur deren Mittel + ein paar Nachbarn
+    total = sum(dedup.values())
+    top = Counter(dedup).most_common(2)
+    if top and sum(c for _, c in top) / total >= 0.8:
+        anchors = {t[0] for t in top}  # die dominanten Levels
+        kept = []
+        for v in dedup:
+            if any(abs(v - a) <= 1.0 for a in anchors):  # ±1 Hebel als Nachbarschaft
+                kept.append(v)
+        vals = kept
+    else:
+        vals = list(dedup.keys())
+
+    # 4) Trimmed mean vorbereiten: bei sehr breiter Streuung etwas beschneiden
+    if len(vals) >= 8:
+        avg = trimmed_mean(vals, 0.1)
+        # optional: zusätzlich zu weit entfernte Ausreißer (>3x Median-Abw.) kappen
+        med = statistics.median(vals)
+        spread = statistics.pstdev(vals) if len(vals) > 1 else 0
+        if spread > 0:
+            vals = [v for v in vals if abs(v - med) <= 3*spread]
+        return vals if len(vals) < 3 else [avg]
+
+    return vals
+
 
 
 def update_loop():
@@ -1043,7 +1097,7 @@ def update_loop():
         except Exception as e:
             log_error(f"onvista scrape failed [{current_underlying}]: {e}")
         finally:
-            stop_event.wait(2.0)  # Intervall
+            stop_event.wait(0.5)  # Intervall
 
 
 def get_vstoxx_change() -> float | None:
@@ -1054,7 +1108,7 @@ def get_vstoxx_change() -> float | None:
     try:
         d = get_driver()
         d.get("https://stock3.com/indizes/vstoxx-volatilitaetsindex-17271029/")
-        el = WebDriverWait(d, 20).until(
+        el = WebDriverWait(d, 5).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "span.instrument-value.changePerc")
             )
@@ -1103,38 +1157,112 @@ def log_index_event(timestamp, index_change):
             writer.writerow(["timestamp", "index_change"])
         writer.writerow([timestamp, index_change])
 
-def _wait_onvista_table(d, timeout=20):
-    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+def _wait_onvista_table(d, timeout=8):
+    WebDriverWait(d, timeout).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
     try:
-        WebDriverWait(d, 6).until(
-            EC.presence_of_element_located((By.XPATH, "//table//th[contains(., 'Hebel') or contains(., 'Gearing')]"))
-        ); return True
+        WebDriverWait(d, 3).until(
+            EC.presence_of_element_located(
+                (By.XPATH, "//table//th[contains(., 'Hebel') or contains(., 'Gearing')]")
+            )
+        )
+        return True
     except Exception:
         pass
-    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody")))
-    time.sleep(0.8); return True
+    # Fallback: warte bis tbody nicht leer ist
+    WebDriverWait(d, 3).until(
+        lambda drv: drv.find_element(By.CSS_SELECTOR, "table tbody").text.strip() != ""
+    )
+    return True
+
+
 
 @lru_cache(maxsize=8)
-def scrape_average_leverage(url_onvista, url_finanzen=None):
-    key = f"onvista_{get_selected_underlying()}"
-    with DRIVER_LOCKS[key]:
-        d = get_driver("onvista", get_selected_underlying())
-        for attempt in range(2):
-            d.get(url_onvista)
-            accept_cookies_if_present(d, timeout=6)
-            try:
-                _wait_onvista_table(d, timeout=20)
-                txt = find_text_retry(d, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
-                vals = _parse_leverage_numbers(txt or "")
-                if vals: 
-                    print(f"Gefundene Hebelwerte von OnVista: {vals}")
-                    return sum(vals)/len(vals)
-            except TimeoutException:
-                pass
-            d.refresh(); time.sleep(1.0)
-    print("Keine Hebelwerte gefunden (nur OnVista aktiv)."); return None
+def scrape_average_leverage(url):
+    """
+    Liest Hebel aus der OnVista-Tabelle.
+    1) Zellen-basiert (wie bisher)
+    2) Fallback: gesamten Tabellen-Text regex-parsen (erfasst auch 'x24,5')
+    Filter: nur 0.5–150; bei None -> 0.0 zurück.
+    """
+    from statistics import mean
+    import re, time
+    from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
 
-    
+    def _only_plausible(nums):
+        out = []
+        for v in nums:
+            try:
+                f = float(str(v).replace(",", "."))
+                if 0.5 <= f <= 150:
+                    out.append(f)
+            except Exception:
+                pass
+        return out
+
+    try:
+        d = get_driver("onvista", KEY_GLOBAL)
+        d.get(url)
+        try:
+            accept_cookies_if_present(d, timeout=5)
+        except Exception:
+            pass
+        # kurze Ladezeit für Tabelle
+        WebDriverWait(d, 2).until(EC.presence_of_element_located((By.CSS_SELECTOR,"table tbody")))
+
+        # --- 1) Zellen-basiert (wie zuvor) ---
+        rows = d.find_elements(By.XPATH, "//table//tbody/tr")
+        hebel = []
+        for row in rows:
+            try:
+                cells = row.find_elements(By.TAG_NAME, "td")
+                if not cells:
+                    continue
+                for cell in cells:
+                    t = (cell.text or "").strip().replace("×","x")
+                    # reine Zahl: 24,5 / 24.5  ODER mit führendem 'x': x24,5
+                    if re.fullmatch(r"(?:x)?\d{1,3}(?:[.,]\d{1,2})?", t, flags=re.I):
+                        t = t.lstrip("xX")
+                        hebel.append(t)
+            except Exception:
+                continue
+
+        hebel = _only_plausible(hebel)
+
+        # --- 2) Fallback: gesamten Tabellen-Text regex-parsen ---
+        if not hebel:
+            try:
+                tbody = d.find_element(By.XPATH, "//table//tbody")
+                txt = (tbody.text or "")
+            except NoSuchElementException:
+                txt = d.page_source  # letzter Notnagel
+
+            nums = re.findall(r"(?:x)?(\d{1,3}(?:[.,]\d{1,2})?)", txt.replace("×","x"), flags=re.I)
+            hebel = _only_plausible(nums)
+
+        if not hebel:
+            print(f"⚠️ Keine Hebelwerte in Tabelle gefunden für: {url}")
+            return 0.0
+
+        # Duplikate reduzieren (OnVista listet oft gleiche Scheine mehrfach)
+        uniq = sorted({round(float(str(v).replace(',', '.')), 2) for v in hebel})
+        # Bei vielen Werten leicht robust mitteln (trimmed)
+        if len(uniq) >= 8:
+            k = max(1, int(len(uniq) * 0.1))
+            trimmed = uniq[k:len(uniq)-k] if len(uniq) > 2*k else uniq
+            avg = sum(trimmed) / len(trimmed)
+        else:
+            avg = sum(uniq) / len(uniq)
+
+        return round(avg, 2)
+
+    except (NoSuchElementException, StaleElementReferenceException):
+        print(f"❌ Fehler beim Auslesen der Hebelwerte: {url}")
+        return 0.0
+    except Exception as e:
+        print(f"❌ Unerwarteter Fehler beim Abrufen der Hebelwerte: {e}")
+        return 0.0
 
 
 def play_alarm():
@@ -1271,9 +1399,11 @@ def get_ampel1_status(df, selected_underlying):
 # === finanztreff.de Backup ===
 
 
-def _ft_accept_cookies(d, timeout=8):
+def _ft_accept_cookies(d, timeout=6):
     try:
-        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        WebDriverWait(d, timeout).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
         for how, sel in [
             (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
             (By.XPATH, "//button[contains(., 'Akzeptieren') or contains(., 'Zustimmen')]"),
@@ -1282,12 +1412,14 @@ def _ft_accept_cookies(d, timeout=8):
                 btn = d.find_element(how, sel)
                 if btn.is_displayed():
                     btn.click()
-                    time.sleep(0.4)
+                    # statt sleep → warten bis Button verschwindet
+                    WebDriverWait(d, 2).until(EC.staleness_of(btn))
                     break
             except Exception:
-                pass
+                continue
     except Exception:
         pass
+
 ###########################USA AMpel 4 Upgradde RSI+Fear##################
 
 ########################### USA Ampel 4 Upgrade RSI+Fear ##################
@@ -1423,7 +1555,7 @@ def _scrape_finanztreff_header(names):
     d.get("https://www.finanztreff.de/")
     _ft_accept_cookies(d)
     WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "header")))
-    time.sleep(1.0)
+    time.sleep(0.2)
     soup = BeautifulSoup(d.page_source, "html.parser")
     text = soup.get_text(" ", strip=True)
     out = {}
@@ -1443,7 +1575,7 @@ def _scrape_finanztreff_markets_estoxx50():
     d.get("https://www.finanztreff.de/")
     _ft_accept_cookies(d)
     WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(1.2)
+    time.sleep(0.2)
     soup = BeautifulSoup(d.page_source, "html.parser")
     target = None
     for t in soup.find_all(string=re.compile(r"\bE\.?\s*Stoxx\s*50\b", re.I)):
@@ -1494,10 +1626,11 @@ def get_index_change_from_finanztreff(underlying):
 # === /finanztreff.de Backup ===
 
 #Fallback vstoxx
-def _stoxx_accept_cookies(d, timeout=10):
+def _stoxx_accept_cookies(d, timeout=6):
     try:
-        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        # häufig OneTrust
+        WebDriverWait(d, timeout).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
         for how, sel in [
             (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
             (By.XPATH, "//button[contains(., 'Accept All') or contains(., 'Akzeptieren') or contains(., 'Zustimmen')]"),
@@ -1505,11 +1638,14 @@ def _stoxx_accept_cookies(d, timeout=10):
             try:
                 btn = d.find_element(how, sel)
                 if btn.is_displayed():
-                    btn.click(); time.sleep(0.6); break
+                    btn.click()
+                    WebDriverWait(d, 2).until(EC.staleness_of(btn))
+                    break
             except Exception:
-                pass
+                continue
     except Exception:
         pass
+
 
 
 
@@ -1518,20 +1654,16 @@ def _stoxx_accept_cookies(d, timeout=10):
 
 
 def get_vdax_change_finanztreff():
-    """
-    Sucht 'VDAX' auf der Startseite und zieht die nächste %-Zahl im selben Block/Text.
-    Null-sicher, ohne .parent-Annäherung.
-    """
     try:
         d = get_driver("general")
         d.get("https://www.finanztreff.de/")
         _ft_accept_cookies_quick(d)
-        WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-        time.sleep(1.0)
+        WebDriverWait(d, 6).until(
+            EC.presence_of_element_located((By.TAG_NAME, "body"))
+        )
         html = d.page_source
         soup = BeautifulSoup(html, "html.parser")
 
-        # Variante A: zuerst kompaktes Text-Matching
         text = soup.get_text(" ", strip=True)
         m = re.search(r"VDAX[^%]{0,120}?([+-]?\d+[.,]\d+)\s*%", text, flags=re.I)
         if m:
@@ -1539,13 +1671,11 @@ def get_vdax_change_finanztreff():
             print(f"✔️ VDAX (finanztreff/Text): {val:.2f} %")
             return val
 
-        # Variante B: gezielte Suche in Elementen, ohne .parent-Ketten
         for node in soup.find_all(string=re.compile(r"\bVDAX\b", re.I)):
-            block = node
-            # suche im selben Container-Text eine Prozentzahl
-            container = block.parent
+            container = node.parent
             for _ in range(4):
-                if not container: break
+                if not container:
+                    break
                 txt = container.get_text(" ", strip=True)
                 m2 = re.search(r"([+-]?\d+[.,]\d+)\s*%", txt)
                 if m2:
@@ -1558,18 +1688,19 @@ def get_vdax_change_finanztreff():
     return None
 
 
+
 def get_vdax_change_yahoo():
-    """Versucht ^VDAX, danach ^VDAXI. Liefert %-Tagesänderung."""
-    for ticker in ("^VDAX", "^VDAXI"):
+    for ticker in ("^VDAX-NEW", "^VDAXI", "^VDAX"):
         try:
-            data = yf.Ticker(ticker).history(period="2d")
-            if len(data) >= 2:
-                prev = data["Close"].iloc[-2]
-                curr = data["Close"].iloc[-1]
-                return round((curr - prev) / prev * 100, 2)
+            data = yf.Ticker(ticker).history(period="5d", interval="1d")
+            closes = data["Close"].dropna()
+            if len(closes) >= 2:
+                prev, curr = float(closes.iloc[-2]), float(closes.iloc[-1])
+                return round((curr - prev) / prev * 100.0, 2)
         except Exception:
             continue
     return None
+
 
 def _safe_spread_pct(long_avg, short_avg):
     if long_avg is None or short_avg is None:
@@ -1582,41 +1713,82 @@ def _safe_spread_pct(long_avg, short_avg):
         return None
 
 def update_data():
-    global last_fetch_time, refresh_interval, selected_underlying
+    global last_fetch_time, refresh_interval
+
     while not stop_event.is_set():
-        current_underlying = selected_underlying
+        # Snapshot des aktuell gewünschten Underlyings (thread-sicher)
+        current_underlying = get_selected_underlying()
         urls = UNDERLYINGS[current_underlying]
-        long_avg = scrape_average_leverage(urls["long"])
-        short_avg = scrape_average_leverage(urls["short"])
-        index_data = get_index_data(current_underlying)
-        index_change, index_display_value = (None, "-")
-        if index_data and len(index_data) == 3:
-            index_change, index_display_value, _ = index_data
 
-        if index_change is None:
-               
-            ft_change = get_index_change_from_finanztreff(current_underlying)
-            if ft_change is not None:
-                index_change = ft_change
+        try:
+            # --- Hebel abrufen ---
+            long_avg = scrape_average_leverage(urls["long"])
+            short_avg = scrape_average_leverage(urls["short"])
 
-        vola_change = get_volatility_change(current_underlying)
-        print(f"Volatility change for {current_underlying}: {vola_change}")
+            # --- Index-Daten ---
+            index_change, index_display_value = (None, "-")
+            idx_tuple = get_index_data(current_underlying)
+            if idx_tuple and len(idx_tuple) == 3:
+                index_change, index_display_value, _ = idx_tuple
+
+            if index_change is None:
+                ft_change = get_index_change_from_finanztreff(current_underlying)
+                if ft_change is not None:
+                    index_change = ft_change
+
+            # --- Volatilität ---
+            vola_change = get_volatility_change(current_underlying)
+            print(f"Volatility change for {current_underlying}: {vola_change}")
+
+        except Exception as e:
+            print(f"❌ Fehler in update_data(): {e}")
+            if stop_event.wait(1.0):
+                break
+            continue
+
+        # Falls während des Abrufs das Underlying gewechselt wurde:
+        # Ergebnisse verwerfen und sofort neuen Loop starten.
+        if current_underlying != get_selected_underlying():
+            if stop_event.wait(0.1):
+                break
+            continue
+
+        # --- Persistenz nur bei sinnvollen Werten ---
         if None not in (long_avg, short_avg, index_change) and abs(index_change) < 10:
             csv_file = get_csv_filename(current_underlying)
             new_data = pd.DataFrame([[
-                datetime.now(TZ_BERLIN), long_avg, short_avg, index_change,
+                datetime.now(TZ_BERLIN),
+                long_avg,
+                short_avg,
+                index_change,
                 _safe_spread_pct(long_avg, short_avg),
                 vola_change
-            ]], columns=["timestamp","long_avg","short_avg","index_change","short_vs_long_diff_prozent","volatility_change"])
-            if os.path.exists(csv_file):
-                df = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
-                if len(df) > 1000: df = df.iloc[-1000:]
-                df = pd.concat([df, new_data], ignore_index=True)
-            else:
-                df = new_data
-            atomic_write_csv(df, csv_file)
-            last_fetch_time = datetime.now(TZ_BERLIN).strftime("%H:%M:%S")
-        time.sleep(refresh_interval)
+            ]], columns=[
+                "timestamp",
+                "long_avg",
+                "short_avg",
+                "index_change",
+                "short_vs_long_diff_prozent",
+                "volatility_change"
+            ])
+
+            try:
+                if os.path.exists(csv_file):
+                    df_old = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
+                    if len(df_old) > 1000:
+                        df_old = df_old.iloc[-1000:]
+                    df = safe_concat([df_old, new_data], ignore_index=True)
+                else:
+                    df = new_data
+                atomic_write_csv(df, csv_file)
+                last_fetch_time = datetime.now(TZ_BERLIN).strftime("%H:%M:%S")
+            except Exception as e:
+                print(f"⚠️ Persistenzfehler: {e}")
+
+        # --- Unterbrechbarer „Sleep“ (reagiert sofort auf stop_event) ---
+        if stop_event.wait(refresh_interval):
+            break
+
 
 def start_update_thread():
     global update_thread, stop_event
@@ -1626,7 +1798,7 @@ def start_update_thread():
     stop_event.clear()
     update_thread = threading.Thread(target=update_data, daemon=True)
     update_thread.start()
-    time.sleep(1)
+    #time.sleep(1)
 
 def get_vol_label(selected_underlying):
     return {"Dax":"VDAX","S&P 500":"VIX","EURO STOXX 50":"VSTOXX","Dow Jones":"VXD","Nasdaq":"VXN"}.get(selected_underlying,"Volatilität")
@@ -1649,7 +1821,7 @@ app.layout = html.Div([
             "WebkitBackgroundClip": "text", "WebkitTextFillColor": "transparent",
             "cursor": "pointer", "display": "inline-block", "marginRight": "10px"
         }),
-        html.Span("v64", style={
+        html.Span("v65", style={
             "fontSize": "16px",
             "color": "#666",
             "verticalAlign": "super",

@@ -20,9 +20,9 @@ from typing import List, Dict, Any, Optional
 
 
 # --- Helpers (oben in der Datei) -----------------------------------
-import requests
 
-FRED_API_KEY = "ec6efd7df5925ad3852f5bf4f2c8ac2e"   # dein echter Key
+
+FRED_API_KEY = "ac24c6331bbe4bd92e5cc0ce443d4d2e"   # dein echter Key
 TE_API_KEY   = "123456"                               # echter TE-Key (Token oder "user:pass")
 
 def _fred_get(path, params):
@@ -63,67 +63,9 @@ def _fetch(url: str, timeout: int = 12) -> Optional[str]:
         return r.text
     except Exception:
         return None
-        
-        
-        
+            
 
-# --- US: FRED -------------------------------------------------------
-def _fetch_us_cpi_dates_via_fred():
-    rel = _fred_get("releases", {"search_text": "Consumer Price Index"})
-    if not rel or "releases" not in rel or not rel["releases"]:
-        return []
-    release_id = sorted(rel["releases"], key=lambda x: x.get("id", 0))[-1]["id"]
 
-    today = date.today()
-    end   = date(today.year + 2, today.month, today.day)
-    dates = _fred_get("release/dates", {
-        "release_id": release_id,
-        "include_release_dates_with_no_data": "true",
-        "realtime_start": today.strftime("%Y-%m-%d"),
-        "realtime_end":   end.strftime("%Y-%m-%d"),
-    })
-    out = []
-    if dates and "release_dates" in dates:
-        for d in dates["release_dates"]:
-            ds = d.get("date")
-            if not ds:
-                continue
-            out.append({"datum": ds, "typ": "CPI",
-                        "text": "US Verbraucherpreise (CPI)",
-                        "index": "SP500"})  # ggf. "S&P 500"
-    return out
-
-# --- DE: TradingEconomics ------------------------------------------
-def _fetch_de_cpi_dates_via_tradingeconomics():
-    js = _te_get("https://api.tradingeconomics.com/calendar/country/germany?format=json")
-    out = []
-    if not js:
-        return out
-    for it in js:
-        name = (it.get("Event") or it.get("Category") or "").lower()
-        if any(k in name for k in ("cpi", "inflation")):
-            ds = (it.get("DateUtc") or it.get("Date") or "")[:10]
-            if not ds:
-                continue
-            # robustes Parsing
-            d = None
-            for fmt in ("%Y-%m-%d", "%m/%d/%Y"):
-                try:
-                    d = datetime.strptime(ds, fmt).date()
-                    break
-                except ValueError:
-                    continue
-            if d:
-                out.append({"datum": d.strftime("%Y-%m-%d"), "typ": "CPI",
-                            "text": "DE Verbraucherpreise (VPI)",
-                            "index": "DAX"})
-    # Dedupe
-    seen, res = set(), []
-    for e in out:
-        k = (e["datum"], e["typ"], e["index"])
-        if k not in seen:
-            seen.add(k); res.append(e)
-    return res
  
  
  #BoJ-Termine (Geldpolitik/YCC/Negativzins)   ---------------------------
@@ -507,7 +449,6 @@ def fetch_fixed_events(year: int, include_minor_us_changes: bool=True, debug: bo
 # ------------------------------------------------------------
 # CPI (US + DE) – robuste Version mit Fallbacks und Debug
 # ------------------------------------------------------------
-from typing import List, Dict, Any
 
 
 # --- Fallbacks für Notfälle (nur falls FRED/TE nicht verfügbar sind – optional erweiterbar)
