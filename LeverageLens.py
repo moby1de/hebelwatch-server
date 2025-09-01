@@ -6,7 +6,6 @@ required_modules = {
     "pandas": "pandas",
     "dash": "dash",
     "selenium": "selenium",
-    "webdriver_manager": "webdriver-manager",
     "yfinance": "yfinance",
     "simpleaudio": "simpleaudio"
 }
@@ -17,10 +16,6 @@ try:
 except ImportError:
     fehlende_module.append("selenium")
 
-try:
-    import webdriver_manager
-except ImportError:
-    fehlende_module.append("webdriver-manager")
 
 try:
     import yfinance
@@ -59,7 +54,7 @@ from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from ereignisse_abruf import compute_us_market_holidays
 from selenium.webdriver.chrome.service import Service
-from webdriver_manager.chrome import ChromeDriverManager
+
 from selenium.webdriver.chrome.options import Options
 import tempfile, shutil, atexit
 from datetime import timedelta
@@ -677,6 +672,10 @@ def build_vola_strip(category: str, base_leverage: float, recommended_leverage) 
 #++++++++++++++++++++++++++ ENDE Für Kategorie Volatilität (1-5) und Hebel Vorschlag#######################
 
 
+from selenium.webdriver.chrome.service import Service
+from selenium import webdriver
+import os
+
 def start_driver(headless=True):
     if _APP_SHUTDOWN:
         raise RuntimeError("App shutting down; no new drivers")
@@ -686,15 +685,16 @@ def start_driver(headless=True):
         return _DRIVER
 
     opts = webdriver.ChromeOptions()
-    if headless: opts.add_argument("--headless=new")
-    opts.add_experimental_option("detach", False)
+    if headless:
+        opts.add_argument("--headless=new")
+    opts.add_argument("--no-sandbox")
+    opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--log-level=2")
-    # vermeidet „Geister“-Relaunches über OS-Optimierungen
-    opts.add_argument("--disable-backgrounding-occluded-windows")
-    opts.add_argument("--disable-renderer-backgrounding")
+    opts.add_argument("--window-size=1280,900")
+    # Chromium-Binary im Container/Render:
+    opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
 
-    service = Service(ChromeDriverManager().install())
+    service = Service()  # Selenium Manager wählt den passenden Driver
     drv = webdriver.Chrome(service=service, options=opts)
     drv.set_page_load_timeout(20)
     drv.set_script_timeout(20)
@@ -708,6 +708,7 @@ def start_driver(headless=True):
     except Exception:
         pass
     return drv
+
 
 
 def set_sound_enabled(val: bool):
