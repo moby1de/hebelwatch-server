@@ -6,6 +6,7 @@ required_modules = {
     "pandas": "pandas",
     "dash": "dash",
     "selenium": "selenium",
+    "webdriver_manager": "webdriver-manager",
     "yfinance": "yfinance",
     "simpleaudio": "simpleaudio"
 }
@@ -16,6 +17,10 @@ try:
 except ImportError:
     fehlende_module.append("selenium")
 
+try:
+    import webdriver_manager
+except ImportError:
+    fehlende_module.append("webdriver-manager")
 
 try:
     import yfinance
@@ -54,7 +59,7 @@ from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
 from ereignisse_abruf import compute_us_market_holidays
 from selenium.webdriver.chrome.service import Service
-
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
 import tempfile, shutil, atexit
 from datetime import timedelta
@@ -179,27 +184,48 @@ def reset_jump_filters(_=None):
 
 
 
-from selenium.webdriver.chrome.service import Service
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-import os
+def get_driver(*args, headless=True):
+    # args werden ignoriert, nur für Kompatibilität zu get_driver("role", key)
+    if SHUTTING_DOWN:
+        raise RuntimeError("Shutdown in progress")
 
-def get_driver(*_, headless=True):
-    opts = Options()
+    # vorhandenen Driver wiederverwenden
+    for d in list(_DRIVERS):
+        try:
+            _ = d.title
+            return d
+        except:
+            pass
+
+
+    from selenium.webdriver.chrome.service import Service
+    from webdriver_manager.chrome import ChromeDriverManager
+
+    opts = webdriver.ChromeOptions()
     if headless:
         opts.add_argument("--headless=new")
-    # Render/Container-Flags
+    opts.add_experimental_option("detach", False)
+    opts.add_argument("--disable-background-networking")
+    opts.add_argument("--disable-features=OptimizationGuideModelDownloading")
+    # Wichtige Optionen für sauberes Beenden
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1280,900")
-    # falls Chromium statt Google-Chrome:
-    opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+    opts.add_argument("--log-level=3")
+    opts.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
+    opts.add_experimental_option('useAutomationExtension', False)
 
-    service = Service()                 # <- Selenium Manager lädt passenden Driver
+    service = Service(ChromeDriverManager().install())
     drv = webdriver.Chrome(service=service, options=opts)
-    return drv
 
+    _DRIVERS.append(drv)
+    _SERVICES.append(service)
+    try:
+        if getattr(service, "process", None):
+            _SERVICE_PIDS.append(service.process.pid)
+    except:
+        pass
+    return drv
 
 
 ######################chrome beenden####################
@@ -672,10 +698,6 @@ def build_vola_strip(category: str, base_leverage: float, recommended_leverage) 
 #++++++++++++++++++++++++++ ENDE Für Kategorie Volatilität (1-5) und Hebel Vorschlag#######################
 
 
-from selenium.webdriver.chrome.service import Service
-from selenium import webdriver
-import os
-
 def start_driver(headless=True):
     if _APP_SHUTDOWN:
         raise RuntimeError("App shutting down; no new drivers")
@@ -685,16 +707,15 @@ def start_driver(headless=True):
         return _DRIVER
 
     opts = webdriver.ChromeOptions()
-    if headless:
-        opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
+    if headless: opts.add_argument("--headless=new")
+    opts.add_experimental_option("detach", False)
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1280,900")
-    # Chromium-Binary im Container/Render:
-    opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
+    opts.add_argument("--log-level=2")
+    # vermeidet „Geister“-Relaunches über OS-Optimierungen
+    opts.add_argument("--disable-backgrounding-occluded-windows")
+    opts.add_argument("--disable-renderer-backgrounding")
 
-    service = Service()  # Selenium Manager wählt den passenden Driver
+    service = Service(ChromeDriverManager().install())
     drv = webdriver.Chrome(service=service, options=opts)
     drv.set_page_load_timeout(20)
     drv.set_script_timeout(20)
@@ -708,7 +729,6 @@ def start_driver(headless=True):
     except Exception:
         pass
     return drv
-
 
 
 def set_sound_enabled(val: bool):
@@ -2757,8 +2777,21 @@ atexit.register(shutdown_all_drivers)
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8050))
-    app.run_server(host="0.0.0.0", port=port, debug=False)
-
+    try:
+        start_update_thread()
+        threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
+        
+        # App starten
+        app.run(debug=False, host="127.0.0.1", port=8050, use_reloader=False)
+        
+    except OSError as e:
+        if "Address already in use" in str(e):
+            print(f"Port 8050 is already in use. Trying port 8051...")
+            app.run(debug=False, host="127.0.0.1", port=8051, use_reloader=False)
+        else:
+            raise e
+    except Exception as e:
+        print(f"Unerwarteter Fehler: {e}")
+    finally:
         # Sicherstellen, dass alle Ressourcen bereinigt werden
-      #  shutdown_all_drivers()
+        shutdown_all_drivers()
