@@ -625,3 +625,92 @@ def bewerte_ampel_3(ereignisse: List[Dict[str, Any]], indexname: str):
 # {market_status}
 
 __all__ = ['lade_oder_erstelle_ereignisse', 'bewerte_ampel_3']
+
+
+# --- US-Börsenfeiertage (NYSE/Nasdaq) ---------------------------------------
+from datetime import date, timedelta
+
+def _nth_weekday_of_month(y, m, weekday, n):
+    d = date(y, m, 1)
+    offset = (weekday - d.weekday()) % 7
+    return d + timedelta(days=offset + 7*(n-1))
+
+def _last_weekday_of_month(y, m, weekday):
+    # gehe auf den 1. des Folgemonats, 1 Tag zurück, dann zum gewünschten Wochentag
+    if m == 12:
+        d = date(y+1, 1, 1) - timedelta(days=1)
+    else:
+        d = date(y, m+1, 1) - timedelta(days=1)
+    offset = (d.weekday() - weekday) % 7
+    return d - timedelta(days=offset)
+
+def _easter_sunday(y):
+    # Anonymous Gregorian algorithm
+    a = y % 19
+    b = y // 100
+    c = y % 100
+    d = b // 4
+    e = b % 4
+    f = (b + 8) // 25
+    g = (b - f + 1) // 3
+    h = (19*a + b - d - g + 15) % 30
+    i = c // 4
+    k = c % 4
+    l = (32 + 2*e + 2*i - h - k) % 7
+    m = (a + 11*h + 22*l) // 451
+    month = (h + l - 7*m + 114) // 31
+    day = ((h + l - 7*m + 114) % 31) + 1
+    return date(y, month, day)
+
+def _observed_weekend(d: date) -> date:
+    # NYSE-Regel: Samstag -> Freitag davor, Sonntag -> Montag danach
+    if d.weekday() == 5:
+        return d - timedelta(days=1)
+    if d.weekday() == 6:
+        return d + timedelta(days=1)
+    return d
+
+def compute_us_market_holidays(year: int):
+    """Vollschließungen (Early Closes nicht enthalten)."""
+    out = []
+
+    # Fixe Tage (mit Observed-Regel)
+    new_years = _observed_weekend(date(year, 1, 1))
+    independence = _observed_weekend(date(year, 7, 4))
+    christmas = _observed_weekend(date(year, 12, 25))
+    # Juneteenth (seit 2022)
+    juneteenth = _observed_weekend(date(year, 6, 19))
+
+    # Bewegliche
+    mlk = _nth_weekday_of_month(year, 1, 0, 3)          # 3. Montag im Jan
+    presidents = _nth_weekday_of_month(year, 2, 0, 3)   # 3. Montag im Feb
+    good_friday = _easter_sunday(year) - timedelta(days=2)
+    memorial = _last_weekday_of_month(year, 5, 0)       # letzter Montag im Mai
+    labor = _nth_weekday_of_month(year, 9, 0, 1)        # 1. Montag im Sep
+    thanksgiving = _nth_weekday_of_month(year, 11, 3, 4)  # 4. Donnerstag im Nov
+
+    def _add(d: date, name: str):
+        if d.year == year:
+            out.append({
+                "datum": d.strftime("%Y-%m-%d"),
+                "typ": "Holiday",
+                "text": f"US-Börsenfeiertag: {name}",
+                "index": "USA"
+            })
+
+    _add(new_years,    "New Year's Day")
+    _add(mlk,          "Martin Luther King Jr. Day")
+    _add(presidents,   "Presidents’ Day")
+    _add(good_friday,  "Good Friday")
+    _add(memorial,     "Memorial Day")
+    _add(juneteenth,   "Juneteenth")
+    _add(independence, "Independence Day")
+    _add(labor,        "Labor Day")
+    _add(thanksgiving, "Thanksgiving Day")
+    _add(christmas,    "Christmas Day")
+
+    out.sort(key=lambda x: x["datum"])
+    return out
+
+
+

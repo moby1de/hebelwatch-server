@@ -1,4 +1,4 @@
-# Hebelwatch Markus Jurina (markus@jurina.biz) 23.08.2025 v65
+# Hebelwatch Markus Jurina (markus@jurina.biz) 31.08.2025 v69
 # SOFR +Öffnungszeit update #
 # Kontrolle bei Programmstart - notwendige Module
 
@@ -43,7 +43,7 @@ if fehlende_module:
     print("pip install " + " ".join(fehlende_module))
 
 # Programmstart
-import os
+
 import csv
 import time
 import platform
@@ -57,6 +57,7 @@ import requests
 from contextlib import contextmanager
 from selenium import webdriver
 from ereignisse_abruf import lade_oder_erstelle_ereignisse, bewerte_ampel_3
+from ereignisse_abruf import compute_us_market_holidays
 from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.chrome.options import Options
@@ -66,20 +67,18 @@ import gc
 import yfinance as yf
 from functools import lru_cache
 import math
+import numpy as np
 import pytz
 from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
-import plotly.io as pio
 from contextlib import suppress
 from threading import Lock
 import re
 import signal
 import os, sys
-from selenium.common.exceptions import StaleElementReferenceException, TimeoutException
+
 # --- Imports (einmalig oben) ---
 from selenium.webdriver.common.by import By
 from collections import defaultdict
-from threading import Lock
 FILE_LOCKS = defaultdict(Lock)
 from concurrent.futures import ThreadPoolExecutor
 from selenium.webdriver.support.ui import WebDriverWait
@@ -91,12 +90,9 @@ from selenium.common.exceptions import (
     NoSuchElementException,
     WebDriverException,
 )
-from datetime import datetime
-from collections import defaultdict
 os.environ["ABSEIL_LOGGING_STDERR_THRESHOLD"] = "3"   # nur Errors
 os.environ["GLOG_minloglevel"] = "3"
 os.environ["NO_AT_BRIDGE"] = "1"  # weniger GTK-Warnungen
-import threading
 _FNG_RT = {"ts": 0, "val": None}
 KEY_GLOBAL = "__global__"
 DRIVERS: dict[str, "WebDriver"] = {}
@@ -110,6 +106,83 @@ _DRIVERS = []
 _SERVICES = []
 _SERVICE_PIDS = []
 SHUTTING_DOWN = False
+# === RSI Schwellwerte ===
+RSI_WARN = 65   # ab hier Orange
+RSI_OVERBOUGHT = 70  # ab hier Rot
+#-------------------
+# Ampel 1 – Empfindlichkeit + Trend-Filter (skaleninvariant)
+AMP1_POS_DELTA       = 0.35   # symmetrisch: 0.5±DELTA → 0.85/0.15
+AMP1_RECENT_WIN      = 60     # Punkte für Trendmessung (~10 min bei 10s-Takt)
+AMP1_MIN_MOVE_SIGMA  = 1.2    # Faktor * Std der jüngsten Bewegungen
+AMP1_MIN_MOVE_FLOOR  = 0.05   # absoluter Mindestschwellwert
+_US_HOLI = {"year": None, "dates": set()}
+def _us_holiday_dates(y):
+    if _US_HOLI["year"] != y:
+        ev = compute_us_market_holidays(y)
+        _US_HOLI["year"] = y
+        _US_HOLI["dates"] = {e["datum"] for e in ev}
+    return _US_HOLI["dates"]
+
+
+
+# === Zweistufiger Bestätigungsfilter (10%-Regel) ===
+# === OneOutlierFilter: blockt nur den *ersten* Sprung > rel_thresh ===
+
+from threading import Lock
+
+def _is_num(x):
+    return isinstance(x, (int, float)) and math.isfinite(x)
+
+class OneOutlierFilter:
+    def __init__(self, rel_thresh=0.10):
+        self.rel_thresh = rel_thresh
+        self._last = None
+        self._lock = Lock()
+        self._just_blocked = False  # merkt sich, ob der letzte Tick geblockt wurde
+
+    def reset(self):
+        with self._lock:
+            self._last = None
+            self._just_blocked = False
+
+    def update(self, x):
+        with self._lock:
+            if not _is_num(x):
+                return self._last
+
+            if self._last is None:
+                self._last = x
+                self._just_blocked = False
+                return x
+
+            # relativer Sprung?
+            base = max(1e-12, abs(self._last))
+            is_jump = abs(x - self._last) / base > self.rel_thresh
+
+            if is_jump and not self._just_blocked:
+                # genau *einmal* blocken
+                self._last = x        # neuen Level merken
+                self._just_blocked = True
+                return None           # 1 Tick auslassen
+            else:
+                # danach sofort echte Werte übernehmen
+                self._last = x
+                self._just_blocked = False
+                return x
+
+# Instanzen
+LEVER_LONG_FILTER  = OneOutlierFilter(rel_thresh=0.10)
+LEVER_SHORT_FILTER = OneOutlierFilter(rel_thresh=0.10)
+VOL_FILTER         = OneOutlierFilter(rel_thresh=0.10)
+INDEX_FILTER       = OneOutlierFilter(rel_thresh=0.10)
+
+def reset_jump_filters(_=None):
+    LEVER_LONG_FILTER.reset()
+    LEVER_SHORT_FILTER.reset()
+    VOL_FILTER.reset()
+    INDEX_FILTER.reset()
+
+
 
 def get_driver(*args, headless=True):
     # args werden ignoriert, nur für Kompatibilität zu get_driver("role", key)
@@ -124,7 +197,7 @@ def get_driver(*args, headless=True):
         except:
             pass
 
-    from selenium import webdriver
+
     from selenium.webdriver.chrome.service import Service
     from webdriver_manager.chrome import ChromeDriverManager
 
@@ -202,6 +275,10 @@ def _signal_handler(sig, frame):
     _cleanup()
     sys.exit(0)
 
+
+
+
+
 # Signale registrieren
 def _register_signals():
     import threading
@@ -214,10 +291,6 @@ def _register_signals():
 
 atexit.register(_cleanup)
 
-
-
-
-######################Ende chrome beenden#################
 
 
 TZ_BERLIN = pytz.timezone("Europe/Berlin")
@@ -276,10 +349,10 @@ def get_sofr_proxy_comment(cache_sec=1800):
     # Kategorie-Text gemäß deiner Skala
     if abs(bps) > 100:
         txt = "Extrem (Systemkrise): >100 bps – Historisch nur in Krisen (2007 Bankenkrise bis 465 bps, Corona 2020 140 bps)."
-    elif abs(bps) >= 70:
-        txt = "Kritisch (Liquiditätsstress): 70–100 bps – Banken leihen zögerlich. Meist Vorbote stärkerer Abverkäufe."
+    elif abs(bps) >= RSI_OVERBOUGHT:
+        txt = "Kritisch (Liquiditätsstress): RSI_OVERBOUGHT–100 bps – Banken leihen zögerlich. Meist Vorbote stärkerer Abverkäufe."
     elif abs(bps) >= 40:
-        txt = "Erhöht (Interbankmarkt wird nervös): 40–70 bps – Frühwarnsignal für knapper werdende Liquidität."
+        txt = "Erhöht (Interbankmarkt wird nervös): 40–RSI_OVERBOUGHT bps – Frühwarnsignal für knapper werdende Liquidität."
     elif abs(bps) >= 10:
         txt = "Normalbereich (kein Stress): 10–40 bps – Typisch in ruhigen Marktphasen."
     else:
@@ -288,37 +361,44 @@ def get_sofr_proxy_comment(cache_sec=1800):
     _SOFR_CACHE.update({"ts": now, "bps": bps, "text": txt})
     return bps, txt
 ##################################################################################################
-from concurrent.futures import ThreadPoolExecutor
-
 def scrape_onvista_leverage(current_underlying: str) -> list[float]:
-    urls = UNDERLYINGS[current_underlying]
-    def scrape(url):
-        try:
-            d = get_driver("onvista", KEY_GLOBAL)
-            d.get(url + f"?t={int(time.time())}")
-            WebDriverWait(d, 3).until(lambda d: "x" in d.find_element(By.CSS_SELECTOR, "table tbody").text)
-            txt = d.find_element(By.CSS_SELECTOR, "table tbody").text
-            vals = _parse_leverage_numbers(txt)
-            return sum(vals)/len(vals) if vals else 15.0
-        except Exception:
-            return 15.0
+    key = f"onvista_{current_underlying}"
+    lock = DRIVER_LOCKS[key]
+    with lock:
+        drv = get_driver("onvista", current_underlying)
+        url_long = ONVISTA_URLS[current_underlying]["long"]
+        drv.get(url_long)
 
-    with ThreadPoolExecutor(max_workers=2) as ex:
-        res = list(ex.map(scrape, [urls["long"], urls["short"]]))
-    return res if len(res)==2 else [15.0,15.0]
+        WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #page, .content"))
+        )
 
+        with suppress(Exception):
+            table_txt = find_text_retry(drv, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
+            vals = _parse_leverage_numbers(table_txt)
+            if vals:
+                return vals
+
+        drv.get(ONVISTA_URLS[current_underlying]["short"])
+        WebDriverWait(drv, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "main, #page, .content"))
+        )
+        table_txt = find_text_retry(drv, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
+        return _parse_leverage_numbers(table_txt)
 
 def switch_underlying(new_underlying: str):
     # A) laufenden Loop sauber stoppen
     stop_event.set()
     if update_thread and update_thread.is_alive():
-        update_thread.join(timeout=1)
+        update_thread.join(timeout=5)
 
     # B) alte Driver schließen
     reset_drivers_on_underlying_change(old_underlying=selected_underlying)
 
     # C) globalen Zustand setzen
     set_selected_underlying(new_underlying)  # deine Setter-Funktion
+    for k in list(_volatility_cache.keys()):
+        _volatility_cache[k] = {"value": None, "ts": 0}
 
     # D) Caches leeren
     with suppress(Exception):
@@ -331,7 +411,7 @@ def switch_underlying(new_underlying: str):
 
 
 
-def get_vstoxx_change_stock3(driver=None, timeout=3, retries=3):
+def get_vstoxx_change_stock3(driver=None, timeout=25, retries=3):
     global _last_vstoxx_change
     url = "https://stock3.com/indizes/vstoxx-volatilitaetsindex-17271029/"
 
@@ -354,10 +434,7 @@ def get_vstoxx_change_stock3(driver=None, timeout=3, retries=3):
                 return _last_vstoxx_change
 
             driver.refresh()
-            WebDriverWait(driver, 1).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "span.instrument-value.changePerc"))
-)
-
+            time.sleep(2)
         except (TimeoutException, StaleElementReferenceException, WebDriverException) as e:
             print(f"⚠️ VSTOXX Versuch {attempt+1}: {e}")
             time.sleep(3)
@@ -368,7 +445,7 @@ def get_vstoxx_change_onvista():
     try:
         d = get_driver("general", KEY_GLOBAL)
         d.get("https://www.onvista.de/index/VSTOXX-Volatilitaetsindex-Index-12105800")
-        WebDriverWait(d, 0.5).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(2.5)
         # Positiv/negativ wird per Klasse markiert; Wert steckt im value-Attribut des <data>-Tags.
         try:
             el = d.find_element(By.CSS_SELECTOR, "data.text-positive.whitespace-nowrap.ml-4")
@@ -405,8 +482,221 @@ _SOUND_ENABLED = True
 _SOUND_LOCK = Lock()
 _APP_SHUTDOWN = False
 
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+#++++++++++++++++++++++++++ Für Kategorie Volatilität (1-5) und Hebel Vorschlag#######################
+
+# --- ATR5%-Engine + Vola-Balken + Hebel-Autopilot ---------------------------
+from zoneinfo import ZoneInfo
+TZ = ZoneInfo("Europe/Berlin")
+
+ATR_BASE_DAYS = 60          # Referenzfenster
+ATR_INTERVAL  = "5m"        # 5-Minuten-Kerzen
+ATR_EMA_SPAN  = 3           # Glättung über 3 Kerzen = 15 Min
+LEVER_MIN, LEVER_MAX = 2.0, 30.0
+BASE_LEVERAGE_DEFAULT = 20.0  # Startwert im UI und Fallback
+
+
+# Kategorien relativ zum 30-T-Median m (x = aktueller ATR5% geglättet)
+# r = x/m
+VOLA_THRESH = {
+    "very_low": 0.60,   # r < 0.60
+    "low":      0.90,   # 0.60 ≤ r < 0.90
+    "high":     1.10,   # 0.90 ≤ r ≤ 1.10  -> normal
+    "very_high":1.50,   # 1.10 < r ≤ 1.50  -> erhöht
+}                       # r > 1.50 -> sehr hoch
+
+VOLA_COLORS = {
+    "very_low":  "#d93636",  # rot
+    "low":       "#ffd84d",  # gelb
+    "normal":    "#43a047",  # grün
+    "elevated":  "#43a047",  # grün
+    "very_high": "#ffd84d",  # gelb
+    "off":       "#9e9e9e",
+}
+
+YF_SYMBOL = {
+    "Dax": "^GDAXI",
+    "EURO STOXX 50": "^STOXX50E",
+    "S&P 500": "^GSPC",
+    "Dow Jones": "^DJI",
+    "Nasdaq": "^IXIC",
+}
+
+VOLA_DESCRIPTIONS = {
+    "very_low": "Volatilität unter 60% des Medians → Handel nicht empfohlen, da ein Trend schwer erkennbar ist",
+    "low": "60-90% des Medians → unterdurchschn. Volatilität; Es empfiehlt sich einen anderen Index anzuschauen",
+    "normal": "90-110% des Medians → typische Marktvolatilität",
+    "elevated": "110-150% des Medians → überdurchschn. Volatilität, Chancen steigen, aber der Hebel sollte angepasst werden",
+    "very_high": "über 150% des Medians → extreme Volatilität, Hebel-anpassung und News prüfen",
+    "off": "Keine Volatilitätsdaten verfügbar"
+}
+
+_ATR_CACHE_BASE = {}   # {underlying: {"ts": epoch, "m": float}}
+_ATR_CACHE_CURR = {}   # {underlying: {"ts": epoch, "x": float}}
+
+def _trading_hours(underlying: str):
+    if underlying in ("Dax", "EURO STOXX 50"):
+        return ("09:00", "17:35")
+    return ("15:30", "22:00")
+
+def _to_berlin_index(idx):
+    try:
+        if idx.tz is None:
+            return idx.tz_localize("UTC").tz_convert(TZ)
+        return idx.tz_convert(TZ)
+    except Exception:
+        # falls naive lokale Zeit: als Berlin interpretieren
+        return idx.tz_localize(TZ)
+
+def _yf_5m(symbol: str, period: str) -> "pd.DataFrame":
+    df = yf.download(symbol, period=period, interval=ATR_INTERVAL, auto_adjust=True, progress=False)
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.rename(columns=str.title)
+    df.index = _to_berlin_index(df.index)
+    return df
+
+def _filter_hours(df: "pd.DataFrame", underlying: str):
+    if df.empty: return df
+    start, end = _trading_hours(underlying)
+    return df.between_time(start, end)
+
+def _atr5pct(df: "pd.DataFrame"):
+    if df.empty: return pd.Series(dtype=float)
+    o,h,l,c = df["Open"], df["High"], df["Low"], df["Close"]
+    prev_c  = c.shift(1)
+    tr = np.maximum(h-l, np.maximum((h - prev_c).abs(), (l - prev_c).abs()))
+    atr = tr.ewm(span=14, adjust=False).mean()
+    atr_pct = (atr / c) * 100.0
+    return atr_pct
+    
+INDEX_POOL = ["Dax","EURO STOXX 50","S&P 500","Dow Jones","Nasdaq"]
+
+def _mean_baseline_vola(exclude: str | None = None) -> float | None:
+    vals = []
+    for u2 in INDEX_POOL:
+        if exclude and u2 == exclude:
+            continue
+        m2 = _get_baseline_m(u2)
+        if m2 and m2 > 0:
+            vals.append(float(m2))
+    if not vals:
+        return None
+    return float(np.mean(vals))
+
+
+def _get_baseline_m(underlying: str) -> float | None:
+    now = time.time()
+    ent = _ATR_CACHE_BASE.get(underlying, {})
+    # Cache 30 Minuten
+    if ent and now - ent.get("ts", 0) < 1800:
+        return ent.get("m")
+    sym = YF_SYMBOL.get(underlying)
+    if not sym: return None
+    df = _yf_5m(sym, period=f"{ATR_BASE_DAYS}d")
+    df = _filter_hours(df, underlying)
+    atr_pct = _atr5pct(df)
+    m = float(_to_scalar(atr_pct.median())) if not atr_pct.empty else None  # Fixed line
+    if m and m > 0:
+        _ATR_CACHE_BASE[underlying] = {"ts": now, "m": m}
+    return m
+
+def _get_current_x(underlying: str) -> float | None:
+    now = time.time()
+    ent = _ATR_CACHE_CURR.get(underlying, {})
+    # wir aktualisieren im Callback durch Interval; hier kleiner Cache 60s
+    if ent and now - ent.get("ts", 0) < 60:
+        return ent.get("x")
+    sym = YF_SYMBOL.get(underlying)
+    if not sym: return None
+    df = _yf_5m(sym, period="2d")
+    df = _filter_hours(df, underlying)
+    atr_pct = _atr5pct(df)
+    if atr_pct.empty: 
+        return None
+    x = float(_to_scalar(atr_pct.ewm(span=ATR_EMA_SPAN, adjust=False).mean().iloc[-1]))  # Fixed line
+    _ATR_CACHE_CURR[underlying] = {"ts": now, "x": x}
+    return x
+
+def _categorize(x: float, m: float) -> str:
+    if not x or not m or m <= 0: return "off"
+    r = x / m
+    if r < VOLA_THRESH["very_low"]:             return "very_low"
+    if r < VOLA_THRESH["low"]:                  return "low"
+    if r <= VOLA_THRESH["high"]:                return "normal"
+    if r <= VOLA_THRESH["very_high"]:           return "elevated"
+    return "very_high"
+
+def _recommend_leverage(x: float, m: float, base_leverage: float | None = None) -> float | None:
+    if not x or not m or x <= 0 or m <= 0:
+        return None
+    if base_leverage is None:
+        base_leverage = BASE_LEVERAGE_DEFAULT
+    raw = base_leverage * (m / x)
+    clipped = min(LEVER_MAX, raw)              # keine Untergrenze
+    return round(clipped * 2) / 2.0
+
+
+
+# Zuerst die build_vola_strip Funktion aktualisieren:
+def _to_scalar(v):
+    # wandelt 1-Element-Objekte sauber in float
+    try:
+        if hasattr(v, "item"):        # numpy scalar / 0-d array / pandas Scalar
+            v = v.item()
+        elif hasattr(v, "iloc"):       # 1-Element-Series/DataFrame
+            v = v.iloc[0]  # This is the recommended approach
+        # Additional check for single-element Series
+        elif isinstance(v, pd.Series) and len(v) == 1:
+            v = v.iloc[0]
+    except Exception:
+        pass
+    return v
+
+def build_vola_strip(category: str, base_leverage: float, recommended_leverage) -> list:
+    labels = [("very_low","Sehr niedrig"), ("low","Niedrig"), ("normal","Normal"),
+              ("elevated","Erhöht"), ("very_high","Sehr hoch")]
+    segs = []
+
+    # auf Skalar normieren, FutureWarning vermeiden
+    base_leverage = _to_scalar(base_leverage)
+    recommended_leverage = None if recommended_leverage is None else _to_scalar(recommended_leverage)
+
+    for key, lab in labels:
+        active = (key == category)
+        bg = VOLA_COLORS.get(key, "#eee") if active else "#eeeeee"
+        border = f"2px solid {VOLA_COLORS.get(key, '#aaa')}" if active else "1px solid #cccccc"
+
+        if active:
+            # immer variabel anzeigen (auch bei "normal")
+            if recommended_leverage is not None:
+                try:
+                    val_txt = f"{float(_to_scalar(recommended_leverage)):.1f}×"
+                except Exception:
+                    val_txt = "\u00A0"
+            else:
+                val_txt = "\u00A0"
+        else:
+            # inaktive Felder bleiben leer
+            val_txt = "\u00A0"
+
+        segs.append(html.Div([
+            html.Div(lab,     style={"fontSize":"16px","lineHeight":"1.05","fontWeight":"600","minHeight":"18px"}),
+            html.Div(val_txt, style={"fontSize":"16px","lineHeight":"1.05","fontWeight":"600","minHeight":"18px"})
+        ], style={
+            "flex":"0 0 84px",
+            "display":"flex","flexDirection":"column","alignItems":"center","justifyContent":"center",
+            "textAlign":"center","padding":"6px 4px",
+            "backgroundColor": bg, "border": border, "borderRadius":"6px",
+            "marginRight":"4px","minHeight":"48px"
+        }))
+    segs[-1].style["marginRight"] = "0px"
+    return segs
+
+
+
+
+#++++++++++++++++++++++++++ ENDE Für Kategorie Volatilität (1-5) und Hebel Vorschlag#######################
+
 
 def start_driver(headless=True):
     if _APP_SHUTDOWN:
@@ -494,15 +784,6 @@ ALARM_DURATION_SEC = 3
 
 FONT_STACK = "Segoe UI, Segoe UI Variable, Roboto, Helvetica Neue, Arial, Noto Sans, Liberation Sans, system-ui, -apple-system, sans-serif"
 
-# Plotly Template
-pio.templates["hebelwatch"] = go.layout.Template(
-    layout=dict(
-        font=dict(family=FONT_STACK, size=13),
-        title=dict(font=dict(family=FONT_STACK, size=16)),
-        legend=dict(font=dict(family=FONT_STACK, size=12))
-    )
-)
-pio.templates.default = "hebelwatch+plotly_white"
 
 # Initialize the app mit korrektem Asset-Pfad (für PyInstaller-Linux wichtig)
 app = Dash(
@@ -519,7 +800,7 @@ show_volatility = True
 ampel1_text = "Standard Kommentar"
 NEWS_REFRESH_SECONDS = 60
 NEWS_TOTAL_ITEMS = 9
-NEWS_PAGE_SIZE = 4
+NEWS_PAGE_SIZE = 5
 NEWS_SWITCH_EVERY_N_INTERVALS = 4
 MARKET_TIMES = {
     "USA": {"start": {"hour": 15, "minute": 30}, "end": {"hour": 22, "minute": 0}},
@@ -542,11 +823,21 @@ def is_market_open(underlying):
     end_dt   = now.replace(hour=end_time["hour"],   minute=end_time["minute"],   second=0, microsecond=0)
     market_hours = f"{start_time['hour']:02d}:{start_time['minute']:02d}-{end_time['hour']:02d}:{end_time['minute']:02d} Uhr MEZ"
 
-    # Wochenende oder fester Feiertag -> geschlossen
-    if now.weekday() >= 5 or (now.month, now.day) in HOLIDAYS_FIXED.get(market, set()):
+    # Wochenende
+    if now.weekday() >= 5:
         return f"❌ Börse geschlossen ({market_hours})"
 
+    # Feiertage
+    d_iso = now.date().isoformat()
+    if market == "USA":
+        if d_iso in _us_holiday_dates(now.year):
+            return f"❌ Börse geschlossen (Feiertag, {market_hours})"
+    else:
+        if (now.month, now.day) in HOLIDAYS_FIXED.get("EUROPE", set()):
+            return f"❌ Börse geschlossen (Feiertag, {market_hours})"
+
     return f"✅ Börse geöffnet ({market_hours})" if start_dt <= now <= end_dt else f"❌ Börse geschlossen ({market_hours})"
+
 
 
 # ==== WebDriver-Setup ====
@@ -579,10 +870,8 @@ def _make_chrome_options() -> Options:
     return opts
 
 
-def accept_cookies_if_present(d, timeout=4):
-    WebDriverWait(d, timeout).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
+def accept_cookies_if_present(d, timeout=6):
+    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     for how, sel in [
         (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
         (By.XPATH, "//button[contains(., 'Akzeptieren') or contains(., 'Zustimmen') or contains(., 'Accept All')]"),
@@ -591,13 +880,9 @@ def accept_cookies_if_present(d, timeout=4):
         try:
             btn = d.find_element(how, sel)
             if btn.is_displayed():
-                btn.click()
-                # Statt Sleep warten bis der Button verschwindet
-                WebDriverWait(d, 2).until(EC.staleness_of(btn))
-                break
+                btn.click(); time.sleep(0.6); break
         except Exception:
             pass
-
 
 
 
@@ -683,7 +968,10 @@ def get_news_block(page_index=0):
             )
             for title, link in page_items
         ], style={"paddingLeft": "0", "marginTop": "0"})
-    ], style={"position": "absolute","right": "30px","top": "485px","width": "400px","backgroundColor": "#e0e0e0","padding": "12px","borderRadius": "8px","zIndex": "1000"})
+    ], style={"position": "absolute","right": "30px","top": "460px","width": "400px","backgroundColor": "#e0e0e0","padding": "12px","borderRadius": "8px","zIndex": "1000"})
+
+#Position news block top": "460px","width":
+
 
 # RSI
 def get_rsi(ticker_symbol, period=8):
@@ -707,9 +995,9 @@ def get_rsi(ticker_symbol, period=8):
 def bewerte_rsi_ampel(rsi_value):
     if rsi_value is None:
         return "#808080", "RSI: Keine Daten verfügbar", "Keine Daten"
-    if rsi_value >= 70:
+    if rsi_value >= RSI_OVERBOUGHT:
         return "#ff0000", "RSI-Indikator", f"Risiko: Korrektur innerhalb 8 Tage wahrscheinlich! RSI={rsi_value:.1f}%"
-    elif rsi_value >= 62:
+    elif rsi_value >= RSI_WARN:
         return "#FFA500", "RSI-Indikator", f"Warnung: Markt überhitzt! (RSI {rsi_value:.1f}%) Erhöhtes Rückfall-Risiko"
     else:
         return "#90EE90", "RSI-Indikator", f"RSI unkritisch ({rsi_value:.1f}%)"
@@ -768,7 +1056,7 @@ def set_selected_underlying(u: str):
     with _SELECTED_LOCK:
         selected_underlying = u
 
-refresh_interval = 7
+refresh_interval = 10
 last_fetch_time = "-"
 ALARM_THRESHOLD = 999
 stop_event = threading.Event()
@@ -797,58 +1085,61 @@ def _extract_percent(text: str) -> float | None:
     except ValueError:
         return None
 
-def get_vdax_change(timeout=6):
-    """VDAX %-Änderung: Frankfurt -> Finanztreff -> (optional) Yahoo. Kein 0.0-Fallback."""
-    val = None
-    # 1) Börse Frankfurt: explizit die %-Zelle
-    try:
+def get_vdax_change(timeout=12):
+    """
+    VDAX %-Änderung von boerse-frankfurt.de robust auslesen.
+    Probiert mehrere Selektoren. Kein None ins Cache schreiben.
+    """
+    url = "https://www.boerse-frankfurt.de/index/vdax"
+    def _try_once():
         d = get_driver("general")
-        d.get("https://www.boerse-frankfurt.de/index/vdax?t=%d" % int(time.time()))
+        d.get(url + f"?t={int(time.time())}")
         accept_cookies_if_present(d, timeout=4)
-        el = WebDriverWait(d, timeout).until(
-            EC.presence_of_element_located((By.CSS_SELECTOR, "td.widget-table-cell.text-end.change-percent"))
-        )
-        raw = (el.text or "").strip()
-        val = _parse_german_percent(raw)
-        if val is not None:
-            print(f"✔️ VDAX (Frankfurt): {val:.2f} %")
+        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.2)
+
+        # 1) dd nach dt-Label
+        for xp in [
+            "//dt[normalize-space()='Veränderung zum Vortag']/following-sibling::dd[1]",
+            "//td[normalize-space()='Veränderung zum Vortag']/following-sibling::td[1]",
+            "//div[contains(@class,'change') or contains(@class,'percent') or contains(@class,'veraenderung')]",
+            "//*[contains(text(), '%')]"
+        ]:
+            try:
+                el = d.find_element(By.XPATH, xp)
+                raw = el.text.strip()
+                val = _extract_percent(raw)
+                if val is not None:
+                    return round(val, 2)
+            except Exception:
+                continue
+        return None
+
+    try:
+        val = _try_once()
+        if val is None:
+            # Driver neu und zweiter Versuch
+            with _DRIVER_POOL_LOCK:
+                key = f"general_{selected_underlying}"
+                drv = _DRIVER_POOL.get(key)
+                try:
+                    if drv: drv.quit()
+                except Exception:
+                    pass
+                _DRIVER_POOL.pop(key, None)
+            val = _try_once()
     except Exception as e:
-        pass
-
-    # 2) Finanztreff Backup
-    if val is None:
-        try:
-            val = get_vdax_change_finanztreff()
-            if val is not None:
-                print(f"✔️ VDAX (finanztreff): {val:.2f} %")
-        except Exception:
-            val = None
-
-    # 3) Optional: Yahoo als dritter Versuch (kannst du auch komplett entfernen)
-    if val is None:
-        yv = get_vdax_change_yahoo()  # siehe unten
-        if yv is not None:
-            print(f"✔️ VDAX (Yahoo): {yv:.2f} %")
-        val = yv
-
-    # Plausi: Punktwerte/Fehltreffer verwerfen
-    if val is not None and abs(val) < 0.5:
+        print(f"⚠️ VDAX Frankfurt fehlgeschlagen: {e}")
         val = None
 
-    # Auf Erfolg: Cache setzen (nur für Fehler-Fallback)
+    if val is None:
+        val = get_vdax_change_finanztreff()
+   # if val is None:
+  #      val = get_vdax_change_yahoo()
+
     if val is not None:
         _volatility_cache["Dax"] = {"value": val, "ts": time.time()}
-        return val
-
-    # Fehler: letzte gute Zahl nur als Notnagel (max. 120 s alt)
-    last = _volatility_cache.get("Dax", {})
-    if last and (time.time() - last.get("ts", 0) < 120) and last.get("value") is not None:
-        print("⚠️ VDAX live fehlgeschlagen → benutze letzten gültigen Wert")
-        return last["value"]
-
-    return None
-
-
+    return val
 
 
 def get_EURO_STOXX_50_change():
@@ -1019,85 +1310,24 @@ def reset_drivers_on_underlying_change(old_underlying: str | None = None):
         with suppress(Exception):
             DRIVER_LOCKS.pop(k, None)
 
-import re
-import statistics
-from collections import Counter
 
-def trimmed_mean(values, trim=0.1):
-    if not values:
-        return None
-    vs = sorted(values)
-    k = int(len(vs) * trim)
-    vs = vs[k: len(vs)-k] if len(vs) - 2*k > 0 else vs
-    return round(sum(vs) / len(vs), 2)
+import re
 
 def _parse_leverage_numbers(txt: str) -> list[float]:
-    """
-    Extrahiert plausible Hebel aus Tabellen-Text.
-    Filter:
-      - erlaubt 0.5 <= x <= 150
-      - entfernt Duplikate (auf 2 Dez. gerundet)
-      - verwirft Werte-„Kämme“ (wenn 1–2 Werte >80% der Treffer ausmachen)
-      - gibt am Ende eine Liste gefilterter Hebel zurück
-    """
-    # 1) Rohzahlen holen (x24,5 | 24.5 | 24,5)
-    raw = re.findall(r"(?:x)?(\d{1,3}(?:[.,]\d{1,2})?)", txt, flags=re.IGNORECASE)
-    vals = []
-    for n in raw:
+    # erfasst z.B. "x24,58" oder "24.58" oder "24,58"
+    nums = re.findall(r"(?:x)?(\d{1,3}(?:[.,]\d{1,2})?)", txt, flags=re.IGNORECASE)
+    out = []
+    for n in nums:
+        n = n.replace(".", "").replace(",", ".")
         try:
-            v = float(n.replace(".", "").replace(",", "."))
-            if 0.5 <= v <= 150:
-                vals.append(v)
+            v = float(n)
+            if 0.5 <= v <= 200:   # 0 und Kleinkram raus, Obergrenze bleibt wie besprochen
+                out.append(v)
         except ValueError:
-            continue
-
-    if not vals:
-        return []
-
-    # 2) Duplikate/Mehrfachlistings zusammenfassen (Onvista zeigt identische Scheine oft mehrfach)
-    dedup = {}
-    for v in vals:
-        key = round(v, 2)
-        dedup.setdefault(key, 0)
-        dedup[key] += 1
-
-    # 3) „Kamm“-Filter: Wenn 1–2 Werte >80% aller Treffer stellen, behalten wir nur deren Mittel + ein paar Nachbarn
-    total = sum(dedup.values())
-    top = Counter(dedup).most_common(2)
-    if top and sum(c for _, c in top) / total >= 0.8:
-        anchors = {t[0] for t in top}  # die dominanten Levels
-        kept = []
-        for v in dedup:
-            if any(abs(v - a) <= 1.0 for a in anchors):  # ±1 Hebel als Nachbarschaft
-                kept.append(v)
-        vals = kept
-    else:
-        vals = list(dedup.keys())
-
-    # 4) Trimmed mean vorbereiten: bei sehr breiter Streuung etwas beschneiden
-    if len(vals) >= 8:
-        avg = trimmed_mean(vals, 0.1)
-        # optional: zusätzlich zu weit entfernte Ausreißer (>3x Median-Abw.) kappen
-        med = statistics.median(vals)
-        spread = statistics.pstdev(vals) if len(vals) > 1 else 0
-        if spread > 0:
-            vals = [v for v in vals if abs(v - med) <= 3*spread]
-        return vals if len(vals) < 3 else [avg]
-
-    return vals
+            pass
+    return out
 
 
-
-def update_loop():
-    while not stop_event.is_set():
-        current_underlying = get_selected_underlying()  # einmal lesen
-        try:
-            levs = scrape_onvista_leverage(current_underlying)
-            # … weiterverarbeiten
-        except Exception as e:
-            log_error(f"onvista scrape failed [{current_underlying}]: {e}")
-        finally:
-            stop_event.wait(0.5)  # Intervall
 
 
 def get_vstoxx_change() -> float | None:
@@ -1108,7 +1338,7 @@ def get_vstoxx_change() -> float | None:
     try:
         d = get_driver()
         d.get("https://stock3.com/indizes/vstoxx-volatilitaetsindex-17271029/")
-        el = WebDriverWait(d, 5).until(
+        el = WebDriverWait(d, 20).until(
             EC.presence_of_element_located(
                 (By.CSS_SELECTOR, "span.instrument-value.changePerc")
             )
@@ -1123,6 +1353,22 @@ def get_vstoxx_change() -> float | None:
     except Exception as e:
         print(f"⚠️ Fehler beim VSTOXX-Abruf: {e}")
         return None
+
+# Mein Hebel anpassen an Vola des gewählten Index
+# Cross-Index-Korrektur (nutzt bestehendes _get_current_x)
+INDEX_POOL = ["Dax","EURO STOXX 50","S&P 500","Dow Jones","Nasdaq"]  # deine 5
+
+def _mean_current_vola(exclude: str | None = None) -> float | None:
+    xs = []
+    for u in INDEX_POOL:
+        if exclude and u == exclude:
+            continue
+        xi = _get_current_x(u)
+        if xi and xi > 0:
+            xs.append(xi)
+    if not xs:
+        return None
+    return float(np.mean(xs))
 
 
     
@@ -1157,112 +1403,38 @@ def log_index_event(timestamp, index_change):
             writer.writerow(["timestamp", "index_change"])
         writer.writerow([timestamp, index_change])
 
-def _wait_onvista_table(d, timeout=8):
-    WebDriverWait(d, timeout).until(
-        EC.presence_of_element_located((By.TAG_NAME, "body"))
-    )
+def _wait_onvista_table(d, timeout=20):
+    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
     try:
-        WebDriverWait(d, 3).until(
-            EC.presence_of_element_located(
-                (By.XPATH, "//table//th[contains(., 'Hebel') or contains(., 'Gearing')]")
-            )
-        )
-        return True
+        WebDriverWait(d, 6).until(
+            EC.presence_of_element_located((By.XPATH, "//table//th[contains(., 'Hebel') or contains(., 'Gearing')]"))
+        ); return True
     except Exception:
         pass
-    # Fallback: warte bis tbody nicht leer ist
-    WebDriverWait(d, 3).until(
-        lambda drv: drv.find_element(By.CSS_SELECTOR, "table tbody").text.strip() != ""
-    )
-    return True
-
-
+    WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody")))
+    time.sleep(0.8); return True
 
 @lru_cache(maxsize=8)
-def scrape_average_leverage(url):
-    """
-    Liest Hebel aus der OnVista-Tabelle.
-    1) Zellen-basiert (wie bisher)
-    2) Fallback: gesamten Tabellen-Text regex-parsen (erfasst auch 'x24,5')
-    Filter: nur 0.5–150; bei None -> 0.0 zurück.
-    """
-    from statistics import mean
-    import re, time
-    from selenium.common.exceptions import NoSuchElementException, StaleElementReferenceException
-
-    def _only_plausible(nums):
-        out = []
-        for v in nums:
+def scrape_average_leverage(url_onvista, url_finanzen=None):
+    key = f"onvista_{get_selected_underlying()}"
+    with DRIVER_LOCKS[key]:
+        d = get_driver("onvista", get_selected_underlying())
+        for attempt in range(2):
+            d.get(url_onvista)
+            accept_cookies_if_present(d, timeout=6)
             try:
-                f = float(str(v).replace(",", "."))
-                if 0.5 <= f <= 150:
-                    out.append(f)
-            except Exception:
+                _wait_onvista_table(d, timeout=20)
+                txt = find_text_retry(d, (By.CSS_SELECTOR, "table tbody"), wait_s=10, retries=3)
+                vals = _parse_leverage_numbers(txt or "")
+                if vals: 
+                    print(f"Gefundene Hebelwerte von OnVista: {vals}")
+                    return sum(vals)/len(vals)
+            except TimeoutException:
                 pass
-        return out
+            d.refresh(); time.sleep(1.0)
+    print("Keine Hebelwerte gefunden (nur OnVista aktiv)."); return None
 
-    try:
-        d = get_driver("onvista", KEY_GLOBAL)
-        d.get(url)
-        try:
-            accept_cookies_if_present(d, timeout=5)
-        except Exception:
-            pass
-        # kurze Ladezeit für Tabelle
-        WebDriverWait(d, 2).until(EC.presence_of_element_located((By.CSS_SELECTOR,"table tbody")))
-
-        # --- 1) Zellen-basiert (wie zuvor) ---
-        rows = d.find_elements(By.XPATH, "//table//tbody/tr")
-        hebel = []
-        for row in rows:
-            try:
-                cells = row.find_elements(By.TAG_NAME, "td")
-                if not cells:
-                    continue
-                for cell in cells:
-                    t = (cell.text or "").strip().replace("×","x")
-                    # reine Zahl: 24,5 / 24.5  ODER mit führendem 'x': x24,5
-                    if re.fullmatch(r"(?:x)?\d{1,3}(?:[.,]\d{1,2})?", t, flags=re.I):
-                        t = t.lstrip("xX")
-                        hebel.append(t)
-            except Exception:
-                continue
-
-        hebel = _only_plausible(hebel)
-
-        # --- 2) Fallback: gesamten Tabellen-Text regex-parsen ---
-        if not hebel:
-            try:
-                tbody = d.find_element(By.XPATH, "//table//tbody")
-                txt = (tbody.text or "")
-            except NoSuchElementException:
-                txt = d.page_source  # letzter Notnagel
-
-            nums = re.findall(r"(?:x)?(\d{1,3}(?:[.,]\d{1,2})?)", txt.replace("×","x"), flags=re.I)
-            hebel = _only_plausible(nums)
-
-        if not hebel:
-            print(f"⚠️ Keine Hebelwerte in Tabelle gefunden für: {url}")
-            return 0.0
-
-        # Duplikate reduzieren (OnVista listet oft gleiche Scheine mehrfach)
-        uniq = sorted({round(float(str(v).replace(',', '.')), 2) for v in hebel})
-        # Bei vielen Werten leicht robust mitteln (trimmed)
-        if len(uniq) >= 8:
-            k = max(1, int(len(uniq) * 0.1))
-            trimmed = uniq[k:len(uniq)-k] if len(uniq) > 2*k else uniq
-            avg = sum(trimmed) / len(trimmed)
-        else:
-            avg = sum(uniq) / len(uniq)
-
-        return round(avg, 2)
-
-    except (NoSuchElementException, StaleElementReferenceException):
-        print(f"❌ Fehler beim Auslesen der Hebelwerte: {url}")
-        return 0.0
-    except Exception as e:
-        print(f"❌ Unerwarteter Fehler beim Abrufen der Hebelwerte: {e}")
-        return 0.0
+    
 
 
 def play_alarm():
@@ -1304,20 +1476,20 @@ def bewerte_ampel(long_now, long_prev, short_now, short_prev, timestamp=None, in
         persistenter_kommentar = kommentar; persistenz_counter = 0
     ampel_symbol = "⚪"
     if long_now > short_now:
-        ampel_symbol = "🔴"; base_kommentar = "Alarm: Long-Hebel über Short-Hebel - Banken erwarten fallenden Markt,deswegen bieten Sie kleinere Short an"
+        ampel_symbol = "🔴"; base_kommentar = "🔴 Long-Hebel über Short-Hebel - Banken erwarten fallenden Markt,deswegen bieten Sie kleinere Short an"
     elif long_now < short_now:
-        ampel_symbol = "🟢"; base_kommentar = "Positiv: Short-Hebel über Long-Hebel - Banken erwarten steigenden Markt,deswegen bieten Sie kleinere Long an"
+        ampel_symbol = "🟢"; base_kommentar = "🟢 Short-Hebel über Long-Hebel - Banken erwarten steigenden Markt,deswegen bieten Sie kleinere Long an"
     else:
-        ampel_symbol = "🟡"; base_kommentar = "Neutral: Long- und Short-Hebel gleich"
+        ampel_symbol = "🟡"; base_kommentar = "🟡 Neutral: Long- und Short-Hebel gleich. Evtl: Programm neu starten und CSV löschen"
     thresholds = get_dynamic_thresholds(df_history if df_history is not None else pd.DataFrame())
     rel_delta_long = (long_now - long_prev) / long_prev * 100 * thresholds['leverage_volatility_factor'] if long_prev != 0 else 0
     rel_delta_short = (short_now - short_prev) / short_prev * 100 * thresholds['leverage_volatility_factor'] if short_prev != 0 else 0
     if rel_delta_short <= thresholds['short_crash']:
-        ampel_symbol = "🔴"; base_kommentar = f"Crash-Alarm: Shorts ↓{abs(rel_delta_short):.1f}% (Volatilität: {thresholds['leverage_volatility_factor']:.1f}x)"
+        ampel_symbol = "🔴"; base_kommentar = f"🔴 Crash-Alarm: Shorts ↓{abs(rel_delta_short):.1f}% (Volatilität: {thresholds['leverage_volatility_factor']:.1f}x)"
     elif rel_delta_short <= thresholds['short_warning']:
-        ampel_symbol = "🟠"; base_kommentar = f"Frühwarnung: Shorts ↓{abs(rel_delta_short):.1f}% (Schwelle: {thresholds['short_warning']}%)"
+        ampel_symbol = "🟠"; base_kommentar = f"🟠 Frühwarnung: Shorts ↓{abs(rel_delta_short):.1f}% (Schwelle: {thresholds['short_warning']}%)"
     elif rel_delta_long >= thresholds['long_warn']:
-        ampel_symbol = "🟠"; base_kommentar = f" Long-Push: {rel_delta_long:.1f}% (Schwelle: {thresholds['long_warn']}%)"
+        ampel_symbol = "🟠"; base_kommentar = f" 🟠 Long-Push: {rel_delta_long:.1f}% (Schwelle: {thresholds['long_warn']}%)"
     kommentar = base_kommentar
     if (long_now < long_prev) and (short_now < short_prev):
         kommentar += " | Achtung: Beide Hebel sinken – Banken könnten sich zurückziehen oder hohe Volatilität erwarten"; persistenter_kommentar = kommentar; persistenz_counter = 10
@@ -1327,7 +1499,7 @@ def bewerte_ampel(long_now, long_prev, short_now, short_prev, timestamp=None, in
     verhältnis_vorher = verhältnis_neu
     try:
         rel_diff = abs(short_now - long_now) / ((abs(short_now) + abs(long_now)) / 2) * 100
-        if rel_diff < 9: kommentar += " | Banken unsicher – geringer Unterschied zwischen Long- und Short-Hebel"
+        if rel_diff < 9: kommentar += " | Banken unsicher "
     except ZeroDivisionError:
         pass
     if timestamp:
@@ -1337,8 +1509,8 @@ def bewerte_ampel(long_now, long_prev, short_now, short_prev, timestamp=None, in
 
 def determine_ampel_signal(df):
     if len(df) < 1:
-        return 0.5, "-", "Warte auf Daten", "-", "-", "-"
-    hebel_signal = "Warte auf Daten"
+        return 0.5, "-", "⚪ Warte auf Daten", "-", "-", "-"
+    hebel_signal = "⚪ Warte auf Daten"
     if len(df) >= 2:
         long_now, long_prev = df['long_avg'].iloc[-1], df['long_avg'].iloc[-2]
         short_now, short_prev = df['short_avg'].iloc[-1], df['short_avg'].iloc[-2]
@@ -1370,6 +1542,7 @@ def _ft_accept_cookies_quick(d, timeout=6):
 
 
 def get_ampel1_status(df, selected_underlying):
+    # skaleninvarianter Orange-Filter; Grundstruktur aus Originalfunktion. :contentReference[oaicite:0]{index=0}
     if len(df) < 20 or 'volatility_change' not in df.columns:
         return FARBCODES["gray"], 0.5, "Nicht genug Daten. 50 sec warten."
     try:
@@ -1378,17 +1551,42 @@ def get_ampel1_status(df, selected_underlying):
         i_now = df_window['index_change'].iloc[-1]
         timestamp = df_window['timestamp'].iloc[-1]
         schnittzeit = timestamp.strftime("%H:%M")
-        vola_min, vola_max = df_window['volatility_change'].min(), df_window['volatility_change'].max()
+        vola_min = df_window['volatility_change'].min()
+        vola_max = df_window['volatility_change'].max()
         rel_pos = (v_now - vola_min) / (vola_max - vola_min) if vola_max != vola_min else 0.5
         minmax_text = f"Min: {vola_min:.2f} %, Max: {vola_max:.2f} %"
         vola_wert = f"{v_now:.2f} %"
-        kommentar_vorab = {"Dax":"VDAX","S&P 500":"VIX","EURO STOXX 50":"VSTOXX","Dow Jones":"VXD"}.get(selected_underlying,"VXN")
+        kommentar_vorab = {"Dax": "VDAX", "S&P 500": "VIX", "EURO STOXX 50": "VSTOXX", "Dow Jones": "VXD"}.get(selected_underlying, "VXN")
+
+        # --- skaleninvarianter Trend-Filter (Fallbacks, falls Konstanten noch nicht gesetzt sind) ---
+        AMP1_POS_DELTA      = float(globals().get("AMP1_POS_DELTA", 0.35))   # symmetrisch: 0.5±DELTA → 0.85/0.15
+        AMP1_RECENT_WIN     = int(globals().get("AMP1_RECENT_WIN", 60))      # Punkte für Trendmessung
+        AMP1_MIN_MOVE_SIGMA = float(globals().get("AMP1_MIN_MOVE_SIGMA", 1.2))
+        AMP1_MIN_MOVE_FLOOR = float(globals().get("AMP1_MIN_MOVE_FLOOR", 0.05))
+
+        d = df_window["volatility_change"].diff().dropna()
+        recent = d.tail(AMP1_RECENT_WIN)
+        sigma = float(recent.std(ddof=0)) if len(recent) else 0.0
+        min_move = max(AMP1_MIN_MOVE_FLOOR, AMP1_MIN_MOVE_SIGMA * sigma)
+
+        w = min(AMP1_RECENT_WIN, max(1, len(df_window) - 1))
+        delta_w = float(v_now - df_window['volatility_change'].iloc[-1 - w])
+
+        POS_RISE = 0.5 + AMP1_POS_DELTA
+        POS_FALL = 0.5 - AMP1_POS_DELTA
+
+        # --- Logik ---
         if v_now < i_now and rel_pos < 0.6:
             return FARBCODES["green"], rel_pos, f"{kommentar_vorab} – Vola unter Index – Entspannt.(Veränderung: {vola_wert}, {minmax_text})"
-        elif v_now < i_now and rel_pos >= 0.75:
+
+        # unter Index, hoch im Tagesband → ORANGE nur bei jüngstem Aufwärts-Trend
+        elif (v_now < i_now and rel_pos >= POS_RISE and delta_w > 0 and abs(delta_w) >= min_move):
             return FARBCODES["orange"], rel_pos, f"{kommentar_vorab} – Vola unter Index (gut), aber steigender Trend.(Veränderung: {vola_wert}, {minmax_text})"
-        elif v_now > i_now and rel_pos < 0.45:
+
+        # über Index, tief im Tagesband → ORANGE nur bei jüngstem Abwärts-Trend
+        elif (v_now > i_now and rel_pos <= POS_FALL and delta_w < 0 and abs(delta_w) >= min_move):
             return FARBCODES["orange"], rel_pos, f"{kommentar_vorab} – Vola über Index, aber klar rückläufig – Entspannung möglich.(Veränderung: {vola_wert}, {minmax_text})"
+
         if v_now > i_now:
             return FARBCODES["red"], rel_pos, f"{kommentar_vorab} – Vola über Index – Warnung! Tipp: In Grafik einblenden (Rot seit {schnittzeit}, Veränderung: {vola_wert}, {minmax_text})"
         if vola_max == vola_min and v_now < i_now:
@@ -1396,14 +1594,13 @@ def get_ampel1_status(df, selected_underlying):
     except Exception as e:
         return FARBCODES["gray"], 0.5, f"Fehler in Ampel 1 Analyse: {e}"
 
+
 # === finanztreff.de Backup ===
 
 
-def _ft_accept_cookies(d, timeout=6):
+def _ft_accept_cookies(d, timeout=8):
     try:
-        WebDriverWait(d, timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
         for how, sel in [
             (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
             (By.XPATH, "//button[contains(., 'Akzeptieren') or contains(., 'Zustimmen')]"),
@@ -1412,15 +1609,13 @@ def _ft_accept_cookies(d, timeout=6):
                 btn = d.find_element(how, sel)
                 if btn.is_displayed():
                     btn.click()
-                    # statt sleep → warten bis Button verschwindet
-                    WebDriverWait(d, 2).until(EC.staleness_of(btn))
+                    time.sleep(0.4)
                     break
             except Exception:
-                continue
+                pass
     except Exception:
         pass
 
-###########################USA AMpel 4 Upgradde RSI+Fear##################
 
 ########################### USA Ampel 4 Upgrade RSI+Fear ##################
 def bewerte_ampel4_usa(rsi: float, fear: float):
@@ -1439,7 +1634,7 @@ def bewerte_ampel4_usa(rsi: float, fear: float):
         fear_valid = True
 
     # Mini-Ampeln
-    rsi_led  = "🟢" if rsi < 62.5 else ("🟠" if rsi < 70 else "🔴")
+    rsi_led  = "🟢" if rsi < RSI_WARN else ("🟠" if rsi < RSI_OVERBOUGHT else "🔴")
     if fear < 25:
         fear_led = "🔴"  # Extreme Angst
     elif fear <= 75:
@@ -1448,28 +1643,28 @@ def bewerte_ampel4_usa(rsi: float, fear: float):
         fear_led = "🔴"  # Extreme Gier
 
     if rsi is not None and math.isfinite(rsi) and fear_valid:
-        # Kombinationsmatrix inkl. 62.5–70 Bereich
+        # Kombinationsmatrix inkl. RSI_WARN–RSI_OVERBOUGHT Bereich
         if rsi < 30 and fear < 25:
             color, note = "green", "Extreme Angst + Überverkauft. Antizyklisch Long begünstigt."
-        elif 30 <= rsi < 62.5 and fear < 25:
+        elif 30 <= rsi < RSI_WARN and fear < 25:
             color, note = "green", "Extreme Angst bei neutralem RSI. Pullback-Long nur mit Trendfilter."
         elif rsi < 30 and 25 <= fear <= 75:
             color, note = "green", "Überverkauft. Technischer Rebound möglich."
-        elif 30 <= rsi < 62.5 and fear > 75:
+        elif 30 <= rsi < RSI_WARN and fear > 75:
             color, note = "orange", "Euphorie ohne Überkauft-Bestätigung. Rückschlagrisiko erhöht."
-        elif 62.5 <= rsi < 70 and 25 <= fear <= 75:
+        elif RSI_WARN <= rsi < RSI_OVERBOUGHT and 25 <= fear <= 75:
             color, note = "orange", "RSI-Warnung bei neutralem Sentiment. Rückfallrisiko erhöht."
-        elif 62.5 <= rsi < 70 and fear > 75:
+        elif RSI_WARN <= rsi < RSI_OVERBOUGHT and fear > 75:
             color, note = "orange", "RSI-Warnung + Gier. Rückschlagrisiko."
-        elif 62.5 <= rsi < 70 and fear < 25:
+        elif RSI_WARN <= rsi < RSI_OVERBOUGHT and fear < 25:
             color, note = "gray", "Widerspruch: RSI-Warnung bei Angst. Kein klares Signal."
-        elif rsi >= 70 and 25 <= fear <= 75:
+        elif rsi >= RSI_OVERBOUGHT and 25 <= fear <= 75:
             color, note = "orange", "Überkauft bei neutralem Sentiment. Gewinnsicherung ratsam."
-        elif rsi >= 70 and fear > 75:
+        elif rsi >= RSI_OVERBOUGHT and fear > 75:
             color, note = "red", "Überkauft + Extreme Gier. Short-Setup begünstigt."
         elif rsi < 30 and fear > 75:
             color, note = "gray", "Widerspruch: Überverkauft bei extremer Gier. Kein Signal."
-        elif rsi >= 70 and fear < 25:
+        elif rsi >= RSI_OVERBOUGHT and fear < 25:
             color, note = "gray", "Widerspruch: Überkauft bei extremer Angst. Kein Signal."
         else:
             color, note = "green", "Neutraler Bereich. Kein klares Signal."
@@ -1479,7 +1674,7 @@ def bewerte_ampel4_usa(rsi: float, fear: float):
     # Ausgabe-Kommentar
     _, _, rsi_text = bewerte_rsi_ampel(rsi)
     rsi_comment = f"{rsi_led} {rsi_text}"
-    fear_comment = f"{fear_led} Fear={fear:.0f}"
+    fear_comment = f"{fear_led} Fear & Greed = {fear:.0f}"
     line = f"{rsi_comment}<br>{fear_comment} — {note}"
 
     return color, line
@@ -1555,7 +1750,7 @@ def _scrape_finanztreff_header(names):
     d.get("https://www.finanztreff.de/")
     _ft_accept_cookies(d)
     WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "header")))
-    time.sleep(0.2)
+    time.sleep(1.0)
     soup = BeautifulSoup(d.page_source, "html.parser")
     text = soup.get_text(" ", strip=True)
     out = {}
@@ -1575,7 +1770,7 @@ def _scrape_finanztreff_markets_estoxx50():
     d.get("https://www.finanztreff.de/")
     _ft_accept_cookies(d)
     WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    time.sleep(0.2)
+    time.sleep(1.2)
     soup = BeautifulSoup(d.page_source, "html.parser")
     target = None
     for t in soup.find_all(string=re.compile(r"\bE\.?\s*Stoxx\s*50\b", re.I)):
@@ -1626,11 +1821,10 @@ def get_index_change_from_finanztreff(underlying):
 # === /finanztreff.de Backup ===
 
 #Fallback vstoxx
-def _stoxx_accept_cookies(d, timeout=6):
+def _stoxx_accept_cookies(d, timeout=10):
     try:
-        WebDriverWait(d, timeout).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        WebDriverWait(d, timeout).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        # häufig OneTrust
         for how, sel in [
             (By.CSS_SELECTOR, "button#onetrust-accept-btn-handler"),
             (By.XPATH, "//button[contains(., 'Accept All') or contains(., 'Akzeptieren') or contains(., 'Zustimmen')]"),
@@ -1638,14 +1832,11 @@ def _stoxx_accept_cookies(d, timeout=6):
             try:
                 btn = d.find_element(how, sel)
                 if btn.is_displayed():
-                    btn.click()
-                    WebDriverWait(d, 2).until(EC.staleness_of(btn))
-                    break
+                    btn.click(); time.sleep(0.6); break
             except Exception:
-                continue
+                pass
     except Exception:
         pass
-
 
 
 
@@ -1654,32 +1845,38 @@ def _stoxx_accept_cookies(d, timeout=6):
 
 
 def get_vdax_change_finanztreff():
+    """
+    Sucht 'VDAX' auf der Startseite und zieht die nächste %-Zahl im selben Block/Text.
+    Null-sicher, ohne .parent-Annäherung.
+    """
     try:
         d = get_driver("general")
         d.get("https://www.finanztreff.de/")
         _ft_accept_cookies_quick(d)
-        WebDriverWait(d, 6).until(
-            EC.presence_of_element_located((By.TAG_NAME, "body"))
-        )
+        WebDriverWait(d, 15).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
+        time.sleep(1.0)
         html = d.page_source
         soup = BeautifulSoup(html, "html.parser")
 
+        # Variante A: zuerst kompaktes Text-Matching
         text = soup.get_text(" ", strip=True)
         m = re.search(r"VDAX[^%]{0,120}?([+-]?\d+[.,]\d+)\s*%", text, flags=re.I)
         if m:
-            val = float(m.group(1).replace(",", "."))
+            val = float(_to_scalar(m.group(1).replace(",", ".")))
             print(f"✔️ VDAX (finanztreff/Text): {val:.2f} %")
             return val
 
+        # Variante B: gezielte Suche in Elementen, ohne .parent-Ketten
         for node in soup.find_all(string=re.compile(r"\bVDAX\b", re.I)):
-            container = node.parent
+            block = node
+            # suche im selben Container-Text eine Prozentzahl
+            container = block.parent
             for _ in range(4):
-                if not container:
-                    break
+                if not container: break
                 txt = container.get_text(" ", strip=True)
                 m2 = re.search(r"([+-]?\d+[.,]\d+)\s*%", txt)
                 if m2:
-                    val = float(m2.group(1).replace(",", "."))
+                    val = float(_to_scalar(m2.group(1).replace(",", ".")))
                     print(f"✔️ VDAX (finanztreff/Block): {val:.2f} %")
                     return val
                 container = container.parent
@@ -1688,19 +1885,18 @@ def get_vdax_change_finanztreff():
     return None
 
 
-
 def get_vdax_change_yahoo():
-    for ticker in ("^VDAX-NEW", "^VDAXI", "^VDAX"):
+    """Versucht ^VDAX, danach ^VDAXI. Liefert %-Tagesänderung."""
+    for ticker in ("^VDAX", "^VDAXI"):
         try:
-            data = yf.Ticker(ticker).history(period="5d", interval="1d")
-            closes = data["Close"].dropna()
-            if len(closes) >= 2:
-                prev, curr = float(closes.iloc[-2]), float(closes.iloc[-1])
-                return round((curr - prev) / prev * 100.0, 2)
+            data = yf.Ticker(ticker).history(period="2d")
+            if len(data) >= 2:
+                prev = data["Close"].iloc[-2]
+                curr = data["Close"].iloc[-1]
+                return round((curr - prev) / prev * 100, 2)
         except Exception:
             continue
     return None
-
 
 def _safe_spread_pct(long_avg, short_avg):
     if long_avg is None or short_avg is None:
@@ -1713,81 +1909,74 @@ def _safe_spread_pct(long_avg, short_avg):
         return None
 
 def update_data():
-    global last_fetch_time, refresh_interval
+    global last_fetch_time
 
     while not stop_event.is_set():
-        # Snapshot des aktuell gewünschten Underlyings (thread-sicher)
-        current_underlying = get_selected_underlying()
-        urls = UNDERLYINGS[current_underlying]
-
         try:
-            # --- Hebel abrufen ---
-            long_avg = scrape_average_leverage(urls["long"])
-            short_avg = scrape_average_leverage(urls["short"])
+            cu = get_selected_underlying()  # <- statt current_underlying
+            urls = UNDERLYINGS.get(cu, {})
+            if not urls:
+                print(f"⚠️ Keine URLs für {cu}")
+                time.sleep(refresh_interval)
+                continue
 
-            # --- Index-Daten ---
-            index_change, index_display_value = (None, "-")
-            idx_tuple = get_index_data(current_underlying)
-            if idx_tuple and len(idx_tuple) == 3:
-                index_change, index_display_value, _ = idx_tuple
+            # --- Rohwerte holen ---
+            long_avg_raw  = scrape_average_leverage(urls["long"])
+            short_avg_raw = scrape_average_leverage(urls["short"])
 
-            if index_change is None:
-                ft_change = get_index_change_from_finanztreff(current_underlying)
+            index_change_raw, index_display_value = (None, "-")
+            idx = get_index_data(cu)
+            if idx and len(idx) == 3:
+                index_change_raw, index_display_value, _ = idx
+
+            if index_change_raw is None:
+                ft_change = get_index_change_from_finanztreff(cu)
                 if ft_change is not None:
-                    index_change = ft_change
+                    index_change_raw = ft_change
 
-            # --- Volatilität ---
-            vola_change = get_volatility_change(current_underlying)
-            print(f"Volatility change for {current_underlying}: {vola_change}")
+            vola_change_raw = get_volatility_change(cu)
+
+            # --- 10%-Bestätigungsfilter ---
+            long_avg     = LEVER_LONG_FILTER.update(long_avg_raw)
+            short_avg    = LEVER_SHORT_FILTER.update(short_avg_raw)
+            index_change = INDEX_FILTER.update(index_change_raw)
+            vola_change  = VOL_FILTER.update(vola_change_raw)
+
+            print(f"Volatility change for {cu}: {vola_change}")
+
+            # --- Werte prüfen und CSV schreiben ---
+            if None not in (long_avg, short_avg, index_change) and abs(index_change) < 10:
+                timestamp = pd.Timestamp.now(tz=TZ_BERLIN)
+                filename = get_csv_filename(cu)
+                row = {
+                    "timestamp": timestamp,
+                    "long_avg": long_avg,
+                    "short_avg": short_avg,
+                    "index_change": index_change,
+                    "index_display_value": index_display_value,
+                    "volatility_change": vola_change,
+                }
+
+                df = pd.DataFrame([row])
+                if os.path.exists(filename):
+                    try:
+                        old = pd.read_csv(filename)
+                        if not old.empty:
+                            df = pd.concat([old, df], ignore_index=True)
+                    except Exception as e:
+                        print(f"⚠️ Konnte alte CSV nicht lesen: {e}")
+
+                try:
+                    atomic_write_csv(df, filename)
+                except Exception as e:
+                    print(f"⚠️ Konnte CSV nicht schreiben: {e}")
+
+                last_fetch_time = timestamp.strftime("%H:%M:%S")
 
         except Exception as e:
-            print(f"❌ Fehler in update_data(): {e}")
-            if stop_event.wait(1.0):
-                break
-            continue
+            print(f"⚠️ Fehler in update_data: {e}")
 
-        # Falls während des Abrufs das Underlying gewechselt wurde:
-        # Ergebnisse verwerfen und sofort neuen Loop starten.
-        if current_underlying != get_selected_underlying():
-            if stop_event.wait(0.1):
-                break
-            continue
-
-        # --- Persistenz nur bei sinnvollen Werten ---
-        if None not in (long_avg, short_avg, index_change) and abs(index_change) < 10:
-            csv_file = get_csv_filename(current_underlying)
-            new_data = pd.DataFrame([[
-                datetime.now(TZ_BERLIN),
-                long_avg,
-                short_avg,
-                index_change,
-                _safe_spread_pct(long_avg, short_avg),
-                vola_change
-            ]], columns=[
-                "timestamp",
-                "long_avg",
-                "short_avg",
-                "index_change",
-                "short_vs_long_diff_prozent",
-                "volatility_change"
-            ])
-
-            try:
-                if os.path.exists(csv_file):
-                    df_old = pd.read_csv(csv_file, parse_dates=['timestamp'], encoding='utf-8')
-                    if len(df_old) > 1000:
-                        df_old = df_old.iloc[-1000:]
-                    df = safe_concat([df_old, new_data], ignore_index=True)
-                else:
-                    df = new_data
-                atomic_write_csv(df, csv_file)
-                last_fetch_time = datetime.now(TZ_BERLIN).strftime("%H:%M:%S")
-            except Exception as e:
-                print(f"⚠️ Persistenzfehler: {e}")
-
-        # --- Unterbrechbarer „Sleep“ (reagiert sofort auf stop_event) ---
-        if stop_event.wait(refresh_interval):
-            break
+        time.sleep(refresh_interval)
 
 
 def start_update_thread():
@@ -1798,73 +1987,67 @@ def start_update_thread():
     stop_event.clear()
     update_thread = threading.Thread(target=update_data, daemon=True)
     update_thread.start()
-    #time.sleep(1)
+    time.sleep(1)
 
 def get_vol_label(selected_underlying):
     return {"Dax":"VDAX","S&P 500":"VIX","EURO STOXX 50":"VSTOXX","Dow Jones":"VXD","Nasdaq":"VXN"}.get(selected_underlying,"Volatilität")
 
-
-
-
-
-# -----------------------------------------------
 # -----------------------------------------------
 # -----------------------------------------------
 # Layout
 # -----------------------------------------------
+# Layout (v69) mit Bild am Ende + pointerEvents
 app.layout = html.Div([
     dcc.Store(id="app_state", data={"shutdown": False}),
+
     html.Div([
         html.H1("Leverage Lens", id="exit-title", style={
-            "fontSize": "56px", "fontWeight": "bold", "textAlign": "center",
+            "fontSize": "56px",
+            "fontWeight": "bold",
+            "textAlign": "center",
             "background": "linear-gradient(90deg, red, orange, yellow, green, blue, violet)",
-            "WebkitBackgroundClip": "text", "WebkitTextFillColor": "transparent",
-            "cursor": "pointer", "display": "inline-block", "marginRight": "10px"
+            "WebkitBackgroundClip": "text",
+            "WebkitTextFillColor": "transparent",
+            "cursor": "pointer",
+            "display": "inline-block",
+            "marginRight": "10px"
         }),
-        html.Span("v65", style={
-            "fontSize": "16px",
-            "color": "#666",
-            "verticalAlign": "super",
-            "fontWeight": "normal"
-        }),
-         dcc.ConfirmDialog(
-                             id='confirm-exit',
-                             message='Programm wirklich beenden?',
-         ),
-
-
+        html.Span("v69", style={"fontSize": "16px", "color": "#666", "verticalAlign": "super"}),
+        dcc.ConfirmDialog(id="confirm-exit", message="- Leverage Lens - beenden?")
     ], style={"textAlign": "center", "marginBottom": "20px"}),
 
     html.Div(
         dcc.Dropdown(
-            id='underlying-dropdown',
-            options=[{'label': k, 'value': k} for k in UNDERLYINGS.keys()],
+            id="underlying-dropdown",
+            options=[{"label": k, "value": k} for k in UNDERLYINGS.keys()],
             value=selected_underlying,
-            style={"width": "300px","fontWeight": "bold","fontSize": "22px"}
+            style={"width": "300px", "fontWeight": "bold", "fontSize": "22px"}
         ),
-        style={"display": "flex","justifyContent": "center","margin": "19px 0"}
+        style={"display": "flex", "justifyContent": "center", "margin": "5px 0"}
     ),
 
     html.Div(
         id="index-info",
         children=[
-            html.Div(id="last-fetch-time", style={"fontSize": "16px", "color": "#555", "margin": "80px 0 4px 0"}),
+            html.Div(id="last-fetch-time", style={"fontSize": "16px", "color": "#555", "margin": "20px 0"}),
             html.Div(id="index-display", style={"fontWeight": "bold"})
         ],
-        style={"display": "flex","flexDirection": "column","rowGap": "4px","margin": "10px 0"}
+        style={"display": "flex", "flexDirection": "column", "rowGap": "4px", "margin": "10px 0"}
     ),
 
-    html.Img(src=app.get_asset_url("meinbild2.jpg"),
-             style={'position': 'absolute','top': '30px','right': '30px','width': 'auto','height': '285px','zIndex': '10'}),
-
     html.Div([
-        dcc.Input(id='interval-input', type='number', value=refresh_interval, min=5, step=1,
-                  style={'width': '40px', "fontSize": "18px", "fontWeight": "bold","textAlign": "center"}),
-        html.Button("Intervall ändern (Sek)", id="set-interval-btn", style={'marginLeft': '7px', "fontSize": "18px"}),
-        html.Button("Alle CSV löschen", id="reset-btn", style={'marginLeft': '7px', "fontSize": "18px"})
-    ], style={'margin': '20px 0'}),
-    
-    # ---- Ton-Schalter (bereinigt) ----
+        dcc.Input(
+            id="interval-input",
+            type="number",
+            value=refresh_interval,
+            min=5,
+            step=1,
+            style={"width": "40px", "fontSize": "18px", "fontWeight": "bold", "textAlign": "center"}
+        ),
+        html.Button("Intervall ändern (Sek)", id="set-interval-btn", style={"marginLeft": "7px", "fontSize": "18px"}),
+        html.Button("Alle CSV löschen", id="reset-btn", style={"marginLeft": "7px", "fontSize": "18px"})
+    ], style={"margin": "15px 0"}),
+
     html.Div([
         dcc.Checklist(
             id="sound-toggle",
@@ -1874,27 +2057,111 @@ app.layout = html.Div([
             persistence=True,
             persistence_type="local",
             style={"fontSize": "18px"}
-        ),
-    ], style={'marginTop': '10px'}),
+        )
+    ], style={"marginTop": "10px", "textAlign": "left"}),
 
-    # Volatilitäts-Schalter
     html.Div(
         dcc.RadioItems(
-            id='volatility-toggle',
+            id="volatility-toggle",
             options=[],
-            value='off',
-            labelStyle={'display': 'block'},
-            style={'fontSize': '20px','padding': '6px 10px'},
+            value="off",
+            labelStyle={"display": "inline-block", "margin-right": "15px"},
+            style={"fontSize": "18px", "padding": "6px 10px", "textAlign": "left"},
             inputStyle={"transform": "scale(1.4)", "marginRight": "8px"}
-        )
+        ),
+        style={"textAlign": "left", "margin": "10px 0"}
     ),
 
-    dcc.Graph(id='leverage-graph'),
-    dcc.Interval(id='interval-component', interval=refresh_interval * 1000, n_intervals=0),
-    html.Audio(id="alarm-audio", src="", autoPlay=True, controls=False, style={"display": "none"})
-])  # Closing the main html.Div
+    html.Div(style={"height": "12px"}),
 
+    html.Div([
+        html.Div([
+            html.Label("Dein Basis-Hebel", style={"fontSize": "18px", "fontWeight": "600", "marginRight": "8px"}),
+            dcc.Input(
+                id="base-leverage-input",
+                type="number",
+                value=BASE_LEVERAGE_DEFAULT,
+                min=LEVER_MIN,
+                max=LEVER_MAX,
+                step=0.5,
+                persistence=True,
+                persistence_type="local",
+                style={
+                    "width": "40px",   # hier die Breite
+                    "height": "36px",
+                    "fontSize": "18px",
+                    "padding": "4px 10px",
+                    "textAlign": "right",
+                    "fontWeight": "600",
+                    "border": "1px solid #888",
+                    "borderRadius": "6px"
+                }
+            )
+        ], style={"display": "flex", "alignItems": "center", "gap": "8px"}),
+#Balkengrafik, Ampel 5
+        html.Div(
+            id="vola-strip",
+            style={
+                "position": "absolute",
+                "left": "50%",
+                "transform": "translateX(-50%)",
+                "display": "flex",
+                "flexDirection": "row",
+                "alignItems": "center",
+                "justifyContent": "center",
+                "gap": "4px",
+                "height": "40px", # Höhe
+                "margin": "0"
+            }
+        )
+    ], style={
+        "position": "relative",
+        "height": "80px", # Höhe
+        "paddingBottom": "6px",
+        "marginTop": "10px",
+        "marginBottom": "20px",
+        "width": "100%"
+    }),
 
+    html.Div(id="vola-metrics", style={"textAlign": "center", "fontSize": "12px", "color": "#666", "marginBottom": "5px"}),
+    html.Div(id="vola-leverage", style={"textAlign": "center", "fontSize": "14px", "fontWeight": "bold", "color": "#0066cc"}),
+
+    html.Div(
+        id="vola-description", # Text Ampel5 Besschriftung
+        style={
+        "textAlign": "center", 
+        "fontSize": "16px", 
+        "color": "black", 
+        "marginTop": "0px", 
+        "fontStyle": "standard",
+        #"backgroundColor": "#f0f0f0",
+        "padding": "8px",
+        "borderRadius": "6px",
+        "maxWidth": "800px",
+        "margin": "0 auto"
+        }
+    ),
+
+    dcc.Graph(id="leverage-graph"),
+
+    dcc.Interval(id="interval-component", interval=refresh_interval * 1000, n_intervals=0),
+    dcc.Interval(id="atr-interval", interval=300000, n_intervals=0),
+    html.Audio(id="alarm-audio", src="", autoPlay=True, controls=False, style={"display": "none"}),
+
+    # Bild zuletzt, klick-durchlässig
+    html.Img(
+        src=app.get_asset_url("meinbild2.jpg"),
+        style={
+            "position": "absolute",
+            "top": "30px",
+            "right": "30px",
+            "width": "auto",
+            "height": "220px",
+            "zIndex": "1",
+            "pointerEvents": "none"
+        }
+    )
+])
 
 
 @app.callback(
@@ -1902,9 +2169,7 @@ app.layout = html.Div([
     Input("btn-exit", "n_clicks"),  # oder Klick auf Logo
     prevent_initial_call=True
 )
-def on_exit(_):
-    request_shutdown()
-    return {"shutdown": True}
+
 
 @app.callback(
     Output("main-interval", "disabled"),
@@ -1938,6 +2203,46 @@ def update_volatility_label(selected_underlying):
         {'label': f'Volatilität einblenden: {vol_label}', 'value': 'on'},
         {'label': f'ausblenden', 'value': 'off'}
     ]
+#####für Vola + Hebelempfehlung++++++++++++++
+# Dann den Callback aktualisieren:
+@app.callback(
+    [Output("vola-strip", "children"),
+     Output("vola-metrics", "children"),
+     Output("vola-leverage", "children"),
+     Output("vola-description", "children")],  # Neuer Output
+    [Input("atr-interval", "n_intervals"),
+     Input("underlying-dropdown", "value"),
+     Input("base-leverage-input", "value")]
+)
+def update_vola_strip(_n, u, base_leverage):
+    base = float(base_leverage if base_leverage is not None else BASE_LEVERAGE_DEFAULT)
+
+    # 30T-Baseline (m) und Live-ATR5% EMA(3) (x)
+    m = _get_baseline_m(u)
+    x = _get_current_x(u)
+    if not m or not x:
+        return build_vola_strip("off", base, None), "", "", VOLA_DESCRIPTIONS["off"]
+
+    # Cross-Index-Faktor auf Basis der 30T-Baselines
+    avg_m = _mean_baseline_vola(exclude=None)   # optional: exclude=u
+    if avg_m and avg_m > 0:
+        k = avg_m / m                           # hochvolatile Indizes -> k<1
+        base_star = np.clip(round((base * k) * 2) / 2.0, LEVER_MIN, LEVER_MAX)
+    else:
+        base_star = base
+
+    # Kategorie nach live (x vs m), Empfehlung nutzt korrigierte Basis
+    cat = _categorize(x, m)
+    L = _recommend_leverage(x, m, base_star)
+
+    strip = build_vola_strip(cat, base_star, L)
+    description = VOLA_DESCRIPTIONS.get(cat, VOLA_DESCRIPTIONS["off"])
+    
+    return strip, "", "", description
+
+#####ENDE für Vola + Hebelempfehlung++++++++++++++
+
+
 
 # ---- Haupt-Callback inkl. Sound-Wert ----
 @app.callback(
@@ -1957,6 +2262,7 @@ def update_graph(n, selected, volatility_toggle, sound_value):
     if selected != selected_underlying:
         selected_underlying = selected
         reset_drivers_on_underlying_change()  # ← NEU: Driver zurücksetzen    
+        reset_jump_filters(selected)  
         scrape_average_leverage.cache_clear()
         start_update_thread()
     # Sound-Schalter übernehmen
@@ -2023,7 +2329,7 @@ def update_graph(n, selected, volatility_toggle, sound_value):
         y2_series = df['index_change']
         if show_volatility and 'volatility_change' in df.columns:
             y2_series = pd.concat([y2_series, df['volatility_change']], axis=0)
-        min_val = float(y2_series.min()); max_val = float(y2_series.max())
+        min_val = float(_to_scalar(y2_series.min())); max_val = float(_to_scalar(y2_series.max()))
         span = max_val - min_val; min_range = 1.0; padding = 0.1
         if span < min_range:
             center = (min_val + max_val) / 2.0
@@ -2031,17 +2337,43 @@ def update_graph(n, selected, volatility_toggle, sound_value):
         else:
             y2_range = [min_val - padding, max_val + padding]
         fig.update_layout(
-            title={'text': f"Ø Hebel von Long/Short Turbos ({selected_underlying})",'y': 0.95,'x': 0.5,'xanchor': 'center','yanchor': 'top'},
-            xaxis=dict(title='Zeit'),
-            yaxis=dict(title='Durchschnittlicher Hebel', side='left', showgrid=True),
-            yaxis2=dict(title="Index Veränderung (%)", overlaying='y', side='right', showgrid=False, range=y2_range),
+            title={'text': f"Leverage Lens – {selected_underlying} : Ø Hebel & Marktbewegung",
+                   'y': 0.95, 'x': 0.5, 'xanchor': 'center', 'yanchor': 'top',
+                   'font': {'size': 18, 'weight': 'bold', "color": "black"}},  # Hier wurde 'font' hinzugefügt
+            xaxis=dict(
+                title=dict(text='Zeit', font=dict(color='black', size=18)),
+                tickfont=dict(color='black', size=14),
+                linecolor='black',
+                showline=True
+            ),
+            yaxis=dict(
+                title=dict(text='Durchschnittlicher Hebel', font=dict(color='black', size=16)),
+                side='left',
+                showgrid=True,
+                tickfont=dict(color='black', size=14),
+                linecolor='black',
+                showline=True
+            ),
+            yaxis2=dict(
+                title=dict(text="Index / Vola (%)", font=dict(color='blue', size=16)),
+                overlaying='y',
+                side='right',
+                showgrid=False,
+                range=y2_range,
+                tickfont=dict(color='blue', size=14),
+                linecolor='black',
+                showline=True
+            ),
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-            margin=dict(l=50, r=50, b=50, t=80, pad=4), height=500, plot_bgcolor='rgba(240,240,240,0.8)'
+            margin=dict(l=50, r=50, b=50, t=80, pad=4),
+            height=500,
+            plot_bgcolor='rgba(200,200,200,0.8)'
         )
+
     else:
         now = datetime.now(TZ_BERLIN)
         placeholder_text = "Warte auf ausreichende Daten..." if len(df) == 1 else "Warte auf erste Daten..."
-        fig.add_annotation(text=placeholder_text, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(size=16, color="gray"))
+        fig.add_annotation(text=placeholder_text, xref="paper", yref="paper", x=0.5, y=0.5, showarrow=False, font=dict(size=12, color="gray"))
         fig.add_trace(go.Scatter(x=[now - timedelta(minutes=5), now], y=[0, 50], mode='lines', line=dict(width=0), showlegend=False, hoverinfo='none'))
 
     # Ampel 3
@@ -2063,36 +2395,73 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             ampel2_color = FARBCODES["gray"]
             
 # --- SOFR-Proxy-Werte holen -      
-      
+        #     
+# robuste Defaults VOR dem try
         sofr_bps = 0
         sofr_text = "SOFR-Proxy: keine Daten."
         sofr_mini_color = FARBCODES["gray"]
         sofr_mini_emoji = "⚪"
-        
-        sofr_bps, _ = get_sofr_proxy_comment()  
-        
-        if sofr_bps is None:
+
+        try:
+    # ... determine_ampel_signal etc. ...
+    # SOFR aus Cache holen
+            res = get_sofr_proxy_comment()
+            if isinstance(res, tuple) and len(res) == 2:
+                sofr_bps, sofr_text = res
+    # Miniampel/Farbe
+            if abs(sofr_bps) >= RSI_OVERBOUGHT:
+                sofr_mini_color = FARBCODES["red"];   sofr_mini_emoji = "🔴"
+            elif abs(sofr_bps) >= 40:
+                sofr_mini_color = FARBCODES["orange"];sofr_mini_emoji = "🟠"
+            else:
+                sofr_mini_color = FARBCODES["green"]; sofr_mini_emoji = "🟢"
+
+        except Exception as e:
+            print(f"Fehler bei Signalberechnung: {e}")
+            # sichere Defaults, damit das Layout nie crasht
+            ampel3_signal = "System initialisiert"
+            hebel_signal  = "Warte auf Daten"
+            datenpunkt_info = "Initialisierung läuft"
+            tagesverlauf = "-"
+            ampel3_color = FARBCODES["gray"]
+            ampel1_color = FARBCODES["gray"]
+            ampel2_color = FARBCODES["gray"]
+            ampel1_text_local = ampel1_text
+            # SOFR-Defaults unbedingt auch hier:
             sofr_bps = 0
             sofr_text = "SOFR-Proxy: keine Daten."
+            sofr_mini_color = FARBCODES["gray"]
+            sofr_mini_emoji = "⚪"
+
             
         else:
-            if abs(sofr_bps) > 100:
-                sofr_text = "Extrem (Systemkrise): >100 bps – Historisch nur in Krisen (2007–2008 bis 465 bps, Corona 2020 ca. 140 bps). Signal: akute Banken-/Fundingkrise."
-            elif abs(sofr_bps) >= 70:
-                sofr_text = "Kritisch (Liquiditätsstress): 70–100 bps – Banken leihen zögerlich. Meist Vorbote stärkerer Abverkäufe."
-            elif abs(sofr_bps) >= 40:
-                sofr_text = "Erhöht (Markt wird nervös): 40–70 bps – Leichte Spannungen im Interbankmarkt. Frühwarnsignal für knapper werdende Liquidität."
-            elif abs(sofr_bps) >= 10:
-                sofr_text = "Normalbereich (kein Stress): 10–40 bps – Typisch in ruhigen Marktphasen."
-            else:
-                sofr_text = "Unter Normalbereich (<10 bps) – sehr ruhige Interbank-Lage."    
-        
+    # Your existing SOFR processing logic
+           if abs(sofr_bps) > 100:
+               sofr_text = "Extrem (Systemkrise): >100 bps – Historisch nur in Krisen (2007–2008 bis 465 bps, Corona 2020 ca. 140 bps). Signal: akute Banken-/Fundingkrise"
+               sofr_mini_color = FARBCODES["red"]
+               sofr_mini_emoji = "🔴"
+           elif abs(sofr_bps) >= RSI_OVERBOUGHT:
+               sofr_text = "Kritisch (Liquiditätsstress): RSI_OVERBOUGHT–100 bps – Banken leihen zögerlich. Meist Vorbote stärkerer Abverkäufe."
+               sofr_mini_color = FARBCODES["red"]
+               sofr_mini_emoji = "🔴"
+           elif abs(sofr_bps) >= 40:
+               sofr_text = "Erhöht (Markt wird nervös): 40–RSI_OVERBOUGHT bps – Leichte Spannungen im Interbankmarkt. Frühwarnsignal für knapper werdende Liquidität."
+               sofr_mini_color = FARBCODES["orange"]
+               sofr_mini_emoji = "🟠"
+           elif abs(sofr_bps) >= 10:
+               sofr_text = "Normalbereich (kein Stress): 10–40 bps – Typisch in ruhigen Marktphasen."
+               sofr_mini_color = FARBCODES["green"]
+               sofr_mini_emoji = "🟢"
+           else:
+               sofr_text = "Unter Normalbereich (<10 bps) – sehr ruhige Interbank-Lage"
+               sofr_mini_color = FARBCODES["green"]
+               sofr_mini_emoji = "🟢"
+         
             
-            
-            
+                       
             #
 # Miniampel/Farbe bestimmen
-        if abs(sofr_bps) >= 70:
+        if abs(sofr_bps) >= RSI_OVERBOUGHT:
             sofr_mini_color = FARBCODES["red"]
             sofr_mini_emoji = "🔴"
         elif abs(sofr_bps) >= 40:
@@ -2102,7 +2471,7 @@ def update_graph(n, selected, volatility_toggle, sound_value):
             sofr_mini_color = FARBCODES["green"]
             sofr_mini_emoji = "🟢"
 # Ampel 2 hart überschreiben, wenn Stress hoch        
-        if abs(sofr_bps) >= 70:
+        if abs(sofr_bps) >= RSI_OVERBOUGHT:
             ampel2_color = FARBCODES["red"]
         elif abs(sofr_bps) >= 40 and ampel2_color != FARBCODES["red"]:
             ampel2_color = FARBCODES["orange"]
@@ -2137,8 +2506,8 @@ def update_graph(n, selected, volatility_toggle, sound_value):
     if selected in ("S&P 500", "Dow Jones", "Nasdaq"):
         fear = get_fng_today(force_refresh=True)  # Cache: heute; sonst live; Datei data/fear_greed_us.csv
         color, line = bewerte_ampel4_usa(
-            float(rsi_value) if rsi_value is not None else float("nan"),
-            float(fear) if fear is not None else float("nan")
+            float(_to_scalar(rsi_value)) if rsi_value is not None else float("nan"),
+            float(_to_scalar(fear)) if fear is not None else float("nan")
         )
         ampel4_color = FARBCODES[color]            # "green/orange/red/gray" → Hex
         ampel4_title = "Ampel 4: RSI (8) + Fear & Greed"
@@ -2149,9 +2518,9 @@ def update_graph(n, selected, volatility_toggle, sound_value):
         # Miniampel-Emoji für RSI (nur Non-US)
         if rsi_value is None:
             rsi_emoji = "⚪"
-        elif rsi_value >= 70:
+        elif rsi_value >= RSI_OVERBOUGHT:
             rsi_emoji = "🔴"
-        elif rsi_value >= 62:
+        elif rsi_value >= RSI_WARN:
             rsi_emoji = "🟠"
         else:
             rsi_emoji = "🟢"
@@ -2209,7 +2578,9 @@ def update_graph(n, selected, volatility_toggle, sound_value):
                 html.Div([
                     html.Div(f"Ampel 2: Hebel Watch - Banken Trendfrüherkennung: Long oder Short? (5 bis 30 Minuten)", style={"fontSize": "100%","fontWeight": "bold"}),
                     html.Div("Erkennt: ob Banken verstärkt Longs oder Shorts anbieten, also wo sie - in diesem Augenblick - Risiken sehen", style={"marginLeft": "20px","fontSize": "90%","color": "#333","fontStyle": "normal"}),
-                    html.Div(f"Kommentar: {kommentar}", style={"marginLeft": "40px","fontSize": "90%","color": "#333","fontStyle": "normal"}),
+                    html.Br(),
+                    #html.Span("Kommentar: ", style={"marginLeft": "40px", "fontSize": "90%", "color": "#333", "fontStyle": "normal"}),
+                    html.Div(f"{kommentar}", style={"marginLeft": "40px","fontSize": "90%","color": "#333","fontStyle": "normal"}),
                     html.Div([
                         html.Span(sofr_mini_emoji, style={"marginRight": "6px"}),
                         html.Span(f"SOFR-Spread: {sofr_bps} bps – {sofr_text}")
@@ -2229,11 +2600,12 @@ def update_graph(n, selected, volatility_toggle, sound_value):
                 html.Div(style={"width": "35px","height": "35px","borderRadius": "50%","backgroundColor": ampel4_color,"display": "inline-block","marginRight": "15px","marginTop": "4px","boxShadow": "0 0 8px 2px rgba(255, 255, 255, 0.5)","border": "2px solid #666","boxSizing": "border-box"}),
                 html.Div([
                     html.Div(f"{ampel4_title}", style={"fontSize": "100%","fontWeight": "bold"}),
-                    html.Div("Erkennt: RSI-Überkauft/-verkauft; in USA zusätzlich CNN Fear & Greed", style={"marginLeft": "20px","fontSize": "90%","color": "#333"}),
+                    html.Div("Erkennt: RSI-Überkauft/-verkauft; in USA zusätzlich CNN Fear & Greed", style={"marginLeft": "15px","fontSize": "90%","color": "#333"}),
                     html.Div([
-                        html.Span("Kommentar: ", style={"display": "block"}),
+                        html.Br(),
+                       #html.Span("Kommentar: ", style={"display": "block"}),
                         html.Span(ampel4_text.replace('<br>', '\n'), 
-                                 style={"display": "block", "marginLeft": "20px", "fontSize": "90%", "color": "#333", "whiteSpace": "pre-line"})
+                                 style={"display": "block", "marginLeft": "0px", "fontSize": "90%", "color": "#333", "whiteSpace": "pre-line"})
                     ], style={"marginLeft": "40px"})
                 ])
             ], style={"display": "flex","alignItems": "flex-start","marginBottom": "20px"}),
