@@ -184,48 +184,27 @@ def reset_jump_filters(_=None):
 
 
 
-def get_driver(*args, headless=True):
-    # args werden ignoriert, nur für Kompatibilität zu get_driver("role", key)
-    if SHUTTING_DOWN:
-        raise RuntimeError("Shutdown in progress")
+from selenium.webdriver.chrome.service import Service
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+import os
 
-    # vorhandenen Driver wiederverwenden
-    for d in list(_DRIVERS):
-        try:
-            _ = d.title
-            return d
-        except:
-            pass
-
-
-    from selenium.webdriver.chrome.service import Service
-    from webdriver_manager.chrome import ChromeDriverManager
-
-    opts = webdriver.ChromeOptions()
+def get_driver(*_, headless=True):
+    opts = Options()
     if headless:
         opts.add_argument("--headless=new")
-    opts.add_experimental_option("detach", False)
-    opts.add_argument("--disable-background-networking")
-    opts.add_argument("--disable-features=OptimizationGuideModelDownloading")
-    # Wichtige Optionen für sauberes Beenden
+    # Render/Container-Flags
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--log-level=3")
-    opts.add_experimental_option('excludeSwitches', ['enable-logging', 'enable-automation'])
-    opts.add_experimental_option('useAutomationExtension', False)
+    opts.add_argument("--window-size=1280,900")
+    # falls Chromium statt Google-Chrome:
+    opts.binary_location = os.environ.get("CHROME_BIN", "/usr/bin/chromium")
 
-    service = Service(ChromeDriverManager().install())
+    service = Service()                 # <- Selenium Manager lädt passenden Driver
     drv = webdriver.Chrome(service=service, options=opts)
-
-    _DRIVERS.append(drv)
-    _SERVICES.append(service)
-    try:
-        if getattr(service, "process", None):
-            _SERVICE_PIDS.append(service.process.pid)
-    except:
-        pass
     return drv
+
 
 
 ######################chrome beenden####################
@@ -2777,21 +2756,8 @@ atexit.register(shutdown_all_drivers)
 
 
 if __name__ == "__main__":
-    try:
-        start_update_thread()
-        threading.Timer(0.8, lambda: webbrowser.open("http://127.0.0.1:8050")).start()
-        
-        # App starten
-        app.run(debug=False, host="127.0.0.1", port=8050, use_reloader=False)
-        
-    except OSError as e:
-        if "Address already in use" in str(e):
-            print(f"Port 8050 is already in use. Trying port 8051...")
-            app.run(debug=False, host="127.0.0.1", port=8051, use_reloader=False)
-        else:
-            raise e
-    except Exception as e:
-        print(f"Unerwarteter Fehler: {e}")
-    finally:
+    port = int(os.environ.get("PORT", 8050))
+    app.run_server(host="0.0.0.0", port=port, debug=False)
+
         # Sicherstellen, dass alle Ressourcen bereinigt werden
-        shutdown_all_drivers()
+      #  shutdown_all_drivers()
