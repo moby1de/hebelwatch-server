@@ -6,7 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apt-get update && apt-get install -y \
     chromium chromium-driver \
     fonts-liberation libnss3 libxss1 libasound2 \
+    python3-tk \
     && rm -rf /var/lib/apt/lists/*
+
 
 WORKDIR /app
 COPY requirements.txt .
