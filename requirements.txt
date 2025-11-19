@@ -1,0 +1,24 @@
+# Core
+numpy==2.3.*
+pandas==2.3.*
+
+# Web/UI
+dash==2.17.*
+plotly==5.*
+requests==2.*
+
+# Parsing
+beautifulsoup4==4.*
+lxml==5.*
+
+selenium>=4.13,<5
+
+# Finance/Data
+yfinance==0.2.*
+pytz==2025.*
+
+# Optional Audio nur Windows
+simpleaudio==1.* ; platform_system == "Windows"
+
+# Server nur Nicht-Windows
+gunicorn==22.* ; platform_system != "Windows"

@@ -1,0 +1,26 @@
+@font-face {
+  font-family: "Noto Sans Custom";
+  src: url("NotoSans-Regular.ttf") format("truetype");
+  font-weight: normal;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: "Noto Sans Custom";
+  src: url("NotoSans-Bold.ttf") format("truetype");
+  font-weight: bold;
+  font-style: normal;
+}
+
+@font-face {
+  font-family: "Noto Sans Custom";
+  src: url("NotoSans-Italic.ttf") format("truetype");
+  font-weight: normal;
+  font-style: italic;
+}
+
+/* globale Anwendung */
+body, div, span {
+  font-family: "Noto Sans Custom", sans-serif;
+}
+
